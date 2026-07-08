@@ -1,0 +1,6 @@
+episode,scenario_idx,action_mode,reward,steps,makespan,done_ops,terminated,truncated,dead_end
+0,0,op,-10.250278383493423,74,899.0,74,False,True,True
+1,1,op,-10.250697165727615,64,899.0,64,False,True,True
+2,2,op,-10.250837057828903,64,899.0,64,False,True,True
+3,3,op,-10.243406757712364,60,886.0,60,False,True,True
+4,4,op,-10.246009811758995,66,894.0,66,False,True,True

@@ -1,0 +1,34 @@
+{
+    "funcs":{
+        "S":0.3,
+        "D":0.4,
+        "I":0.3
+    },
+    "total_task":30,
+    "op_per_task":4,
+    "op_duration":[20,40],
+    "candidate_systems": [
+    {"name": "EW aircraft I (S)", "function_type": "S", "cost": 280, "available_from": 20, "available_until": 420},
+    {"name": "EW aircraft I (D)", "function_type": "D", "cost": 280, "available_from": 50, "available_until": 300},
+    {"name": "EW aircraft II (S)", "function_type": "S", "cost": 320, "available_from": 30, "available_until": 900},
+    {"name": "EW aircraft II (D)", "function_type": "D", "cost": 320, "available_from": 20, "available_until": 650},
+    {"name": "Fighter I (S)", "function_type": "S", "cost": 220, "available_from": 50, "available_until": 200},
+    {"name": "Fighter I (I)", "function_type": "I", "cost": 220, "available_from": 100, "available_until": 300},
+    {"name": "Fighter II (S)", "function_type": "S", "cost": 250, "available_from": 80, "available_until": 450},
+    {"name": "Fighter II (I)", "function_type": "I", "cost": 250, "available_from": 60, "available_until": 200},
+    {"name": "Destroyer I (S)", "function_type": "S", "cost": 1200, "available_from": 100, "available_until": 800},
+    {"name": "Destroyer I (D)", "function_type": "D", "cost": 1200, "available_from": 120, "available_until": 800},
+    {"name": "Destroyer I (I)", "function_type": "I", "cost": 1200, "available_from": 20, "available_until": 820},
+    {"name": "Destroyer II (S)", "function_type": "S", "cost": 1500, "available_from": 50, "available_until": 300},
+    {"name": "Destroyer II (D)", "function_type": "D", "cost": 1500, "available_from": 30, "available_until": 900},
+    {"name": "Destroyer II (I)", "function_type": "I", "cost": 1500, "available_from": 20, "available_until": 650},
+    {"name": "UAV I (S)", "function_type": "S", "cost": 50, "available_from": 50, "available_until": 500},
+    {"name": "UAV I (I)", "function_type": "I", "cost": 100, "available_from": 100, "available_until": 900},
+    {"name": "UAV II (S)", "function_type": "S", "cost": 80, "available_from": 30, "available_until": 150},
+    {"name": "UAV II (I)", "function_type": "I", "cost": 120, "available_from": 40, "available_until": 200},
+    {"name": "USV I (S)", "function_type": "S", "cost": 55, "available_from": 100, "available_until": 500},
+    {"name": "USV I (I)", "function_type": "I", "cost": 80, "available_from": 120, "available_until": 400},
+    {"name": "USV II (S)", "function_type": "S", "cost": 88, "available_from": 30, "available_until": 300},
+    {"name": "USV II (I)", "function_type": "I", "cost": 125, "available_from": 100, "available_until": 500}
+  ]
+  }

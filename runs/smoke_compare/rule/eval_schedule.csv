@@ -1,0 +1,11 @@
+episode,scenario_idx,action_mode,task_idx,task_name,op_idx,op_name,func_type,sys_idx,sys_name,start_time,finish_time,duration
+0,0,rule,0,Task_0,0,Op_0_0,D,3,EW aircraft II (D),20.0,68.0,48.0
+0,0,rule,2,Task_2,0,Op_2_0,I,10,Destroyer I (I),20.0,60.0,40.0
+0,0,rule,4,Task_4,0,Op_4_0,S,0,EW aircraft I (S),20.0,57.0,37.0
+0,0,rule,5,Task_5,0,Op_5_0,S,2,EW aircraft II (S),30.0,69.0,39.0
+0,0,rule,6,Task_6,0,Op_6_0,I,17,UAV II (I),40.0,83.0,43.0
+0,0,rule,8,Task_8,0,Op_8_0,S,14,UAV I (S),50.0,73.0,23.0
+0,0,rule,12,Task_12,0,Op_12_0,S,0,EW aircraft I (S),57.0,84.0,27.0
+0,0,rule,9,Task_9,0,Op_9_0,I,7,Fighter II (I),60.0,101.0,41.0
+0,0,rule,11,Task_11,0,Op_11_0,I,10,Destroyer I (I),60.0,110.0,50.0
+0,0,rule,1,Task_1,0,Op_1_0,D,3,EW aircraft II (D),68.0,109.0,41.0

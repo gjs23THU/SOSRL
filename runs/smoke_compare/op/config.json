@@ -1,0 +1,23 @@
+{
+  "action_mode": "op",
+  "episodes": 2,
+  "max_steps": 10,
+  "scenario_pool_size": 2,
+  "scenario_order": "sequential",
+  "selected_system_num": 12,
+  "min_system_num": 3,
+  "max_system_num": 22,
+  "cost_limit": 8000,
+  "gamma": 0.99,
+  "lr": 0.001,
+  "batch_size": 4,
+  "buffer_size": 10000,
+  "min_buffer_size": 4,
+  "target_update_interval": 20,
+  "epsilon_start": 1.0,
+  "epsilon_end": 0.05,
+  "epsilon_decay": 0.995,
+  "hidden_dim": 128,
+  "seed": 1,
+  "device": "cuda"
+}

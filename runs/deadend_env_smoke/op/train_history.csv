@@ -1,0 +1,2 @@
+episode,scenario_idx,scenario_sos,scenario_cost,action_mode,reward,steps,done,terminated,truncated,dead_end,makespan,done_ops,epsilon,loss,replay_size
+0,0,14,7433,op,-0.05246060248464346,5,False,False,False,False,89.0,5,0.995,0.009852467104792595,5
