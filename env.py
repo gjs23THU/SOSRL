@@ -24,8 +24,8 @@ M = 1500  # Example value, replace with actual maximum time if available
 
 class State:
     def __init__(self, arch, mission):
-        self.arch = arch
-        self.mission = mission
+        # self.arch = arch
+        # self.mission = mission
         self.op_assign_sys = np.full((len(mission), O), -1, dtype=np.int32)  # -1 indicates unassigned
         self.op_release_time = np.array([[op.release_time for op in task.operations] for task in mission], dtype=np.float32)  # -1 indicates not started
         self.op_start_time = np.full((len(mission), O), -1.0, dtype=np.float32)  # -1 indicates not started
@@ -39,16 +39,18 @@ class State:
         self.sys_availble_until = np.array([s.available_until if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
         self.sys_release_time = np.array([s.available_from if s in arch else self.M for s in FULL_SOS], dtype=np.float32)
         self.current_time = 0.0
-        self.sos_cost = sum(s.cost for s in arch)
+        # self.sos_cost = sum(s.cost for s in arch)
         self.sys_busy_time = np.array([0 for _ in FULL_SOS], dtype=np.float32)
         self.sys_idle_time = np.array([0 for _ in FULL_SOS], dtype=np.float32)
         self.task_op_idx = np.array([0 for _ in mission], dtype=np.int32)
         self.task_current_op_type = np.array([task.operations[0].func_type for task in mission], dtype=np.float32)
         self.task_completion_time = np.array([math.inf for _ in mission], dtype=np.float32)
+        self.task_release_time = np.array([task.release_time for task in mission], dtype=np.float32)
+        self.task_due_time = np.array([task.due_time for task in mission], dtype=np.float32)
         
 
     def state_dim(self):
-        return ( 5 * N + 2 * T + 2 * T * O+ 3)  # 5 features for each system + 2 features for each task + 2 features for each task-operation pair + 3 global features (sos_cost, current_makespan, current_time)
+        return ( 5 * N + 2 * T + 2 * T * O + 2)  # 5 features for each system + 2 features for each task + 2 features for each task-operation pair + 2 global features (current_makespan, current_time)
 
     def to_obs(self):
         obs = np.concatenate([
@@ -61,7 +63,7 @@ class State:
             (self.sys_idle_time / (self.current_time + 1e-6)), # n dimensions, normalized system idle time
             self.task_op_idx / O,    # T dimensions, completion rate for each task, assuming max 4 operations per task
             self.task_current_op_type, # T dimensions, current operation type for each task
-            np.array([self.sos_cost / FULL_COST], dtype=np.float32), # 1 dimension, total cost of selected systems normalized by the total cost of all systems
+            # np.array([self.sos_cost / FULL_COST], dtype=np.float32), # 1 dimension, total cost of selected systems normalized by the total cost of all systems
             np.array([self.current_makespan / self.M], dtype=np.float32), # 1 dimension, current makespan normalized by the maximum time
             np.array([self.current_time / self.M], dtype=np.float32) # 1 dimension, current time normalized by the maximum time
         ])
@@ -80,7 +82,7 @@ class State:
         self.sys_release_time = np.array([s.available_from if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
         self.task_current_op_type = np.array([task.operations[0].func_type for task in self.mission], dtype=np.float32)
         self.current_time = 0.0
-        self.sos_cost = sum(s.cost for s in self.arch)
+        # self.sos_cost = sum(s.cost for s in self.arch)
         self.sys_busy_time.fill(0.0)
         self.sys_idle_time.fill(0.0)
         self.task_op_idx.fill(0)
@@ -298,27 +300,36 @@ class MissionEnv(gym.Env):
         
         decoded_action = self.decode_action(action)
 
+        old_makespan = float(self.state.current_makespan)
         self.apply_action(decoded_action)
         obs = self.state.to_obs()
-        info = {"valid": True, "dead_end": False, "decode_action": decoded_action, "makespan": self.state.current_makespan, "step_count": self.step_count}
+        makespan_delta = max(0.0, float(self.state.current_makespan) - old_makespan)
+        reward = -makespan_delta / self.state.M
+        info = {
+            "valid": True,
+            "dead_end": False,
+            "decode_action": decoded_action,
+            "makespan": self.state.current_makespan,
+            "makespan_delta": makespan_delta,
+            "step_count": self.step_count,
+        }
 
         terminated = np.all(self.state.task_op_idx == self.O)
         if terminated:
-            reward = 1.0 - self.state.current_makespan / self.state.M
             return obs, float(reward), True, False, info
 
         truncated = self.step_count >= self.max_steps
         if truncated:
-            return obs, -1.0, False, True, info
+            return obs, float(reward - 10.0), False, True, info
 
         dead_end = not np.any(self.mask_invalid_assign())
         if dead_end:
             unfinished_ops = self.T * self.O - int(self.state.task_op_idx.sum())
-            reward = -unfinished_ops / (self.T * self.O)
+            reward -= unfinished_ops / self.T
             info["dead_end"] = True
-            return obs, float(reward), False, False, info
+            return obs, float(reward), True, False, info
 
-        return obs, -0.001, False, False, info
+        return obs, float(reward), False, False, info
 
     def render(self, mode='human'):
         # Render the environment to the screen

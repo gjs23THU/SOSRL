@@ -1,2 +1,0 @@
-episode,scenario_idx,action_mode,reward,steps,makespan,done_ops,terminated,truncated,dead_end
-0,0,rule,-0.02582765929400921,10,110.0,10,False,False,False

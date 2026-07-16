@@ -7,6 +7,7 @@
     "total_task":30,
     "op_per_task":4,
     "op_duration":[20,40],
+    "due_time_tightness":3,
     "candidate_systems": [
     {"name": "EW aircraft I (S)", "function_type": "S", "cost": 280, "available_from": 20, "available_until": 420},
     {"name": "EW aircraft I (D)", "function_type": "D", "cost": 280, "available_from": 50, "available_until": 300},

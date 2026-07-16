@@ -48,15 +48,20 @@ class Operation:
 class Task:
     index:int
     name:str
+    release_time:int
+    due_time:int
     operations:list[Operation]
-    def __init__(self, index:int, name:str, operations:list[Operation]):
+
+    def __init__(self, index:int, name:str, operations:list[Operation], release_time: int=0, due_time: int=0):
         self.index = index
         self.name = name
         self.operations = operations
-    
+        self.release_time = release_time  # Initialize release_time for the task
+        self.due_time = due_time  # Initialize due_time for the task
+
     def randomize_operations(self, func_types:dict[str,int], op_duration:tuple[int, int], op_per_task:int):
         self.operations = []
-        rel_time = 0
+        rel_time = self.release_time  # Start with the task's release time
         for op_index in range(op_per_task):
             func_type = random.choices(list(func_types.keys()), weights=list(func_types.values()))[0]
             func_type = func_type2idx.get(func_type, 0)  # Convert func_type to its corresponding index
@@ -70,6 +75,10 @@ class Task:
             )
             rel_time += duration  # Update release time for the next operation
             self.operations.append(operation)
+        
+    def set_due_time(self,tightness:float=3.0):
+        total_duration = sum(op.duration for op in self.operations)
+        self.due_time = self.release_time + int(self.release_time + total_duration * tightness)
 
 def build_sos_from_config(config: dict[str, Any] | str | PathLike[str]) -> tuple[ComponentSystem, ...]:
     if isinstance(config, (str, PathLike)):
@@ -109,12 +118,14 @@ def build_mission_from_config(config:dict[str,Any]):
         task = Task(
             index=task_index,
             name=f"Task_{task_index}",
-            operations=[]
+            operations=[],
+            release_time=0
         )
         task.randomize_operations(
             func_types=config.get("funcs", {}),
             op_duration=config.get("op_duration", (20, 40)),
             op_per_task=config.get("op_per_task", 4)
         )
+        task.set_due_time(tightness=config.get("due_time_tightness", 3))
         mission.append(task)
     return mission

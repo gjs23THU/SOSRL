@@ -1,6 +1,0 @@
-episode,scenario_idx,action_mode,task_idx,task_name,op_idx,op_name,func_type,sys_idx,sys_name,start_time,finish_time,duration
-0,0,op,8,Task_8,0,Op_8_0,0.6666666666666666,3,EW aircraft II (D),20.0,47.0,27.0
-0,0,op,13,Task_13,0,Op_13_0,0.3333333333333333,0,EW aircraft I (S),20.0,45.0,25.0
-0,0,op,15,Task_15,0,Op_15_0,1.0,13,Destroyer II (I),20.0,57.0,37.0
-0,0,op,27,Task_27,0,Op_27_0,1.0,10,Destroyer I (I),20.0,60.0,40.0
-0,0,op,25,Task_25,0,Op_25_0,0.3333333333333333,20,USV II (S),30.0,63.0,33.0
