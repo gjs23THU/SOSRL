@@ -1,340 +1,417 @@
-import gymnasium as gym  
-import numpy as np
-import syn
-import math, json
-from pathlib import Path
 from typing import Any
-from os import PathLike
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+import gymnasium as gym
+import numpy as np
 
-def load_config(path: str | PathLike[str] = CONFIG_PATH) -> dict[str, Any]:
-    with Path(path).open("r", encoding="utf-8") as file:
-        return json.load(file)
+import syn
 
-CONFIG = load_config()
 
-FULL_SOS= syn.build_sos_from_config(CONFIG)
-FULL_COST = sum(s.cost for s in FULL_SOS)
-
-O = CONFIG.get("op_per_task", 4)
-T = CONFIG.get("total_task", 30)
+FULL_SOS = syn.FULL_SOS
 N = len(FULL_SOS)
-M = 1500  # Example value, replace with actual maximum time if available
+OBSERVATION_SIZE = 25
+
 
 class State:
-    def __init__(self, arch, mission):
-        # self.arch = arch
-        # self.mission = mission
-        self.op_assign_sys = np.full((len(mission), O), -1, dtype=np.int32)  # -1 indicates unassigned
-        self.op_release_time = np.array([[op.release_time for op in task.operations] for task in mission], dtype=np.float32)  # -1 indicates not started
-        self.op_start_time = np.full((len(mission), O), -1.0, dtype=np.float32)  # -1 indicates not started
-        self.op_finish_time = np.full((len(mission), O), -1.0, dtype=np.float32)  # -1 indicates not finished
-        self.op_duration = np.array([[op.duration for op in task.operations] for task in mission], dtype=np.float32)
-        self.current_makespan = 1e-6
-        self.M = sum(op.duration for task in mission for op in task.operations)  # Total duration of all operations in the mission  
-        self.sys_sel_idx = np.array([s.func_type if s in arch else 0 for s in FULL_SOS], dtype=np.float32)  # 0 indicates not selected, otherwise the function type of the system
-        self.sys_work_idx = np.zeros([len(FULL_SOS)], dtype=np.int32)
-        self.sys_availble_time = np.array([s.available_from if s in arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.sys_availble_until = np.array([s.available_until if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.sys_release_time = np.array([s.available_from if s in arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.current_time = 0.0
-        # self.sos_cost = sum(s.cost for s in arch)
-        self.sys_busy_time = np.array([0 for _ in FULL_SOS], dtype=np.float32)
-        self.sys_idle_time = np.array([0 for _ in FULL_SOS], dtype=np.float32)
-        self.task_op_idx = np.array([0 for _ in mission], dtype=np.int32)
-        self.task_current_op_type = np.array([task.operations[0].func_type for task in mission], dtype=np.float32)
-        self.task_completion_time = np.array([math.inf for _ in mission], dtype=np.float32)
-        self.task_release_time = np.array([task.release_time for task in mission], dtype=np.float32)
-        self.task_due_time = np.array([task.due_time for task in mission], dtype=np.float32)
-        
+    """Numeric state for an immutable architecture and a partial list schedule."""
 
-    def state_dim(self):
-        return ( 5 * N + 2 * T + 2 * T * O + 2)  # 5 features for each system + 2 features for each task + 2 features for each task-operation pair + 2 global features (current_makespan, current_time)
+    def __init__(self, selected_system_mask: np.ndarray, mission: list[syn.Task]):
+        task_num = len(mission)
+        op_num = len(mission[0].operations)
+        self.op_num = op_num
+        self.M = max(
+            1.0,
+            float(sum(op.duration for task in mission for op in task.operations)),
+        )
 
-    def to_obs(self):
-        obs = np.concatenate([
-            self.sys_sel_idx,   # n dimensions, 0 if not selected, otherwise the function type of the system 
-            self.sys_work_idx, # n dimensions, 1 if working, 0 if idle
-            (self.op_duration.flatten() / self.M), # T*O dimensions, normalized operation duration
-            (self.op_release_time.flatten() / self.M), # T*O dimensions, normalized operation release time 
-            (self.sys_availble_time / self.M), # n dimensions, normalized system available time
-            (self.sys_busy_time / (self.current_time + 1e-6)), # n dimensions, normalized system busy time
-            (self.sys_idle_time / (self.current_time + 1e-6)), # n dimensions, normalized system idle time
-            self.task_op_idx / O,    # T dimensions, completion rate for each task, assuming max 4 operations per task
-            self.task_current_op_type, # T dimensions, current operation type for each task
-            # np.array([self.sos_cost / FULL_COST], dtype=np.float32), # 1 dimension, total cost of selected systems normalized by the total cost of all systems
-            np.array([self.current_makespan / self.M], dtype=np.float32), # 1 dimension, current makespan normalized by the maximum time
-            np.array([self.current_time / self.M], dtype=np.float32) # 1 dimension, current time normalized by the maximum time
-        ])
-        return np.array(obs, dtype=np.float32)
-    
-    def reset_state(self):
-        self.op_assign_sys.fill(-1)
-        self.op_release_time = np.array([[op.release_time for op in task.operations] for task in self.mission], dtype=np.float32)
-        self.op_start_time.fill(-1.0)
-        self.op_finish_time.fill(-1.0)
-        self.current_makespan = 1e-6
-        self.sys_sel_idx = np.array([s.func_type if s in self.arch else 0 for s in FULL_SOS], dtype=np.float32)
-        self.sys_work_idx.fill(0)
-        self.sys_availble_time = np.array([s.available_from if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.sys_availble_until = np.array([s.available_until if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.sys_release_time = np.array([s.available_from if s in self.arch else self.M for s in FULL_SOS], dtype=np.float32)
-        self.task_current_op_type = np.array([task.operations[0].func_type for task in self.mission], dtype=np.float32)
-        self.current_time = 0.0
-        # self.sos_cost = sum(s.cost for s in self.arch)
-        self.sys_busy_time.fill(0.0)
-        self.sys_idle_time.fill(0.0)
-        self.task_op_idx.fill(0)
-        self.task_completion_time.fill(math.inf)
+        self.selected_system_mask = np.array(selected_system_mask, dtype=bool, copy=True)
 
-    def alocate_op2sys(self, task_idx:int, op_idx:int, sys_idx:int):
-        if self.task_op_idx[task_idx] != op_idx:
-            raise ValueError(f"Operation {op_idx} of task {task_idx} is not available for assignment. Current operation index: {self.task_op_idx[task_idx]}")
-        
-        if self.sys_sel_idx[sys_idx] == 0:
-            raise ValueError(f"System {sys_idx} is not selected.")
-        
-        op = self.mission[task_idx].operations[op_idx]
-        if op.func_type != FULL_SOS[sys_idx].func_type:
-            raise ValueError(f"Operation {op_idx} of task {task_idx} requires function type '{op.func_type}', but system {sys_idx} has function type '{FULL_SOS[sys_idx].func_type}'.")
-        
-        sys_available_from = self.sys_availble_time[sys_idx]
-        op_release_time = self.op_release_time[task_idx][op_idx]
+        self.op_assign_sys = np.full((task_num, op_num), -1, dtype=np.int32)
+        self.op_start_time = np.full((task_num, op_num), -1.0, dtype=np.float32)
+        self.op_finish_time = np.full((task_num, op_num), -1.0, dtype=np.float32)
+        self.op_duration = np.asarray(
+            [[op.duration for op in task.operations] for task in mission],
+            dtype=np.float32,
+        )
+        self.operation_ready_time = np.asarray(
+            [[op.release_time for op in task.operations] for task in mission],
+            dtype=np.float32,
+        )
 
-        start_time = max(sys_available_from, op_release_time, self.current_time)
-        finish_time = start_time + op.duration
-        if finish_time > FULL_SOS[sys_idx].available_until:
-            raise ValueError(f"System {sys_idx} cannot finish operation {op_idx} of task {task_idx} within its available time window.")
-        
-        self.advance_time_to(start_time)  # Advance the current time to the start time of the operation
-        self.op_assign_sys[task_idx][op_idx] = sys_idx # update the assigned system for the operation
-        self.op_start_time[task_idx][op_idx] = start_time # update the start time for the operation
-        self.op_finish_time[task_idx][op_idx] = finish_time # update the finish time for the operation
-        self.sys_work_idx[sys_idx] = 1  # mark the system as working
-        self.sys_availble_time[sys_idx] = self.op_finish_time[task_idx][op_idx] # update the system's available time
-        self.current_makespan = max(self.current_makespan, self.sys_availble_time[sys_idx])  # Update the current makespan
-        
+        self.system_ready_time = np.full(N, np.inf, dtype=np.float32)
+        for sys_idx in np.flatnonzero(self.selected_system_mask):
+            self.system_ready_time[sys_idx] = float(FULL_SOS[sys_idx].available_from)
+        self.system_busy_time = np.zeros(N, dtype=np.float32)
+        self.system_idle_time = np.zeros(N, dtype=np.float32)
 
-        # Update task state
-        self.task_op_idx[task_idx] += 1  # Move to the next operation for the task
-        if self.task_op_idx[task_idx] == O:  # If all operations for the task are completed
-            self.task_completion_time[task_idx] = self.op_finish_time[task_idx][O - 1]  # Update the task's completion time
+        self.current_makespan = 0.0
+        self.task_op_idx = np.zeros(task_num, dtype=np.int32)
+        self.task_due_time = np.asarray(
+            [task.due_time for task in mission],
+            dtype=np.float32,
+        )
+
+        self.task_candidate_mask = np.zeros(task_num, dtype=bool)
+        self.task_waiting_mask = np.zeros(task_num, dtype=bool)
+        self.task_earliest_start = np.zeros(task_num, dtype=np.float32)
+        self.task_remaining_time = np.zeros(task_num, dtype=np.float32)
+        self.task_ttd = np.zeros(task_num, dtype=np.float32)
+        self.task_slack = np.zeros(task_num, dtype=np.float32)
+        self.task_next_type_load = np.zeros(task_num, dtype=np.float32)
+        self.system_ready_delay = np.zeros(N, dtype=np.float32)
+
+    @staticmethod
+    def cv(values: np.ndarray) -> float:
+        if values.size == 0:
+            return 0.0
+        with np.errstate(divide="ignore", invalid="ignore"):
+            value = np.std(values) / np.mean(values)
+        value = np.clip(value, -2.0, 2.0)
+        return float(np.nan_to_num(value, nan=0.0, posinf=2.0, neginf=-2.0))
+
+    def to_obs(self) -> np.ndarray:
+        task_num = len(self.task_op_idx)
+        task_denominator = max(task_num, 1)
+        active_task_mask = self.task_op_idx < self.op_num
+        candidate_mask = self.task_candidate_mask
+        waiting_mask = self.task_waiting_mask
+
+        candidate_indices = np.flatnonzero(candidate_mask)
+        if candidate_indices.size:
+            current_duration = self.op_duration[
+                candidate_indices,
+                self.task_op_idx[candidate_indices],
+            ]
         else:
-            self.task_current_op_type[task_idx] = self.mission[task_idx].operations[op_idx + 1].func_type  # Update the current operation type for the task
-            self.op_release_time[task_idx][op_idx + 1] = self.op_finish_time[task_idx][op_idx] # update the release time for the operation
+            current_duration = np.empty(0, dtype=np.float32)
 
-    def add_system(self, sys_idx:int):
-        if self.sys_sel_idx[sys_idx] != 0:
-            raise ValueError(f"System {sys_idx} is already selected.")
-        self.sys_sel_idx[sys_idx] = FULL_SOS[sys_idx].func_type
-        self.sys_availble_time[sys_idx] = max(self.current_time, FULL_SOS[sys_idx].available_from)
-        self.sys_release_time[sys_idx] = self.sys_availble_time[sys_idx]  # Set the system's release time to its available time
-        self.sys_availble_until[sys_idx] = FULL_SOS[sys_idx].available_until
-        self.sys_work_idx[sys_idx] = 0  # Mark the system as not working
-        self.sos_cost += FULL_SOS[sys_idx].cost
-    
-    def remove_system(self, sys_idx:int):
-        if self.sys_sel_idx[sys_idx] == 0:
-            raise ValueError(f"System {sys_idx} is not selected.")
-        if self.sys_work_idx[sys_idx] == 1:
-            raise ValueError(f"System {sys_idx} is currently working and cannot be removed.")
-        self.sys_sel_idx[sys_idx] = 0
-        self.sys_availble_time[sys_idx] = self.M  # Set the system's available time to the maximum time
-        self.sys_work_idx[sys_idx] = 0  # Mark the system as not working
-        self.sos_cost -= FULL_SOS[sys_idx].cost / 2 # Update the total cost of selected systems, assuming a penalty for removing a system
+        candidate_remaining = self.task_remaining_time[candidate_mask]
+        candidate_next_load = self.task_next_type_load[candidate_mask]
+        candidate_ttd = self.task_ttd[candidate_mask]
+        candidate_slack = self.task_slack[candidate_mask]
+        waiting_slack = self.task_slack[waiting_mask]
+        task_completion = self.task_op_idx / max(self.op_num, 1)
+        selected_delay = self.system_ready_delay[self.selected_system_mask]
 
-    def advance_time_to(self, next_time):
-        if next_time < self.current_time:
-            raise ValueError(f"Cannot advance time backwards. Current time: {self.current_time}, Next time: {next_time}")
-        elif self.current_time == next_time:
-            return  # No time advancement needed
-        
-        old_time = self.current_time
-        self.current_time = next_time
-        # update the state of other systems
-        for sys_idx in range(N):
-            if self.sys_sel_idx[sys_idx] == 0:  # If the system is not selected, skip it
-                continue
-            if self.sys_work_idx[sys_idx] == 1:  # If the system is working
-                finish_time = self.sys_availble_time[sys_idx]
+        obs = np.asarray(
+            [
+                np.count_nonzero(active_task_mask) / task_denominator,
+                np.count_nonzero(candidate_mask) / task_denominator,
+                np.count_nonzero(waiting_mask) / task_denominator,
+                float(np.sum(current_duration)) / self.M if current_duration.size else 0.0,
+                float(np.mean(current_duration)) / self.M if current_duration.size else 0.0,
+                float(np.min(current_duration)) / self.M if current_duration.size else 0.0,
+                float(np.sum(candidate_remaining)) / self.M if candidate_remaining.size else 0.0,
+                float(np.mean(candidate_remaining)) / self.M if candidate_remaining.size else 0.0,
+                float(np.max(candidate_remaining)) / self.M if candidate_remaining.size else 0.0,
+                float(np.mean(candidate_next_load)) / self.M if candidate_next_load.size else 0.0,
+                float(np.min(candidate_next_load)) / self.M if candidate_next_load.size else 0.0,
+                float(np.mean(candidate_ttd)) / self.M if candidate_ttd.size else 0.0,
+                float(np.min(candidate_ttd)) / self.M if candidate_ttd.size else 0.0,
+                float(np.mean(candidate_slack)) / self.M if candidate_slack.size else 0.0,
+                float(np.min(candidate_slack)) / self.M if candidate_slack.size else 0.0,
+                float(np.min(waiting_slack)) / self.M if waiting_slack.size else 0.0,
+                float(np.mean(selected_delay)) / self.M if selected_delay.size else 0.0,
+                float(np.mean(task_completion)) if task_completion.size else 0.0,
+                float(np.mean(candidate_ttd < 0)) if candidate_ttd.size else 0.0,
+                float(np.mean(candidate_slack < 0)) if candidate_slack.size else 0.0,
+                self.cv(current_duration),
+                self.cv(candidate_remaining),
+                self.cv(candidate_ttd),
+                self.cv(candidate_slack),
+                self.cv(candidate_next_load),
+            ],
+            dtype=np.float32,
+        )
+        return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-                busy_delta = max(0, min(finish_time, next_time) - old_time)
-                idle_delta = max(
-                    0, 
-                    min(next_time, self.sys_availble_until[sys_idx]) 
-                    - max(old_time, finish_time, self.sys_release_time[sys_idx]))
-
-                self.sys_busy_time[sys_idx] += busy_delta
-                self.sys_idle_time[sys_idx] += idle_delta
-            
-                if finish_time <= next_time:
-                    self.sys_work_idx[sys_idx] = 0  # Mark the system as not working if it has finished its operation
-            else:
-                idle_delta = max(0, 
-                                 min(next_time, self.sys_availble_until[sys_idx]) 
-                                 - max(old_time, self.sys_release_time[sys_idx]))
-                self.sys_idle_time[sys_idx] += idle_delta  # If the system is idle, increase its idle time by the delta
 
 class MissionEnv(gym.Env):
-    def __init__(self, arch: list[syn.ComponentSystem], mission: list[syn.Task]):
-        # Initialize the environment with architecture and mission, if no architecture or mission is provided, use the default ones from the configuration
-        super(MissionEnv, self).__init__()
-        self.arch = arch
+    """Offline tail-append scheduling environment for a fixed architecture."""
+
+    def __init__(
+        self,
+        architecture: tuple[syn.ComponentSystem, ...] | list[syn.ComponentSystem],
+        mission: list[syn.Task],
+    ):
+        super().__init__()
+        if not mission:
+            raise ValueError("mission must contain at least one task.")
+        operation_counts = {len(task.operations) for task in mission}
+        if len(operation_counts) != 1 or 0 in operation_counts:
+            raise ValueError("all tasks must contain the same non-zero operation count.")
+
+        architecture = tuple(architecture)
+        architecture_indices = [int(system.index) for system in architecture]
+        if len(set(architecture_indices)) != len(architecture_indices):
+            raise ValueError("architecture contains duplicate system indices.")
+        if any(index < 0 or index >= N for index in architecture_indices):
+            raise ValueError("architecture contains an unknown system index.")
+
         self.mission = mission
-        self.state = State(self.arch, self.mission)  # Initialize state with None or appropriate initial 
-        self.step_count = 0
-        self.max_steps = 1000  # Example maximum number of steps, can be adjusted based on the problem
-        self.T = len(self.mission)
-        self.O = O
+        self.T = len(mission)
+        self.O = len(mission[0].operations)
         self.N = N
-        self.current_reward = 0.0
-        self.action_space = gym.spaces.Discrete((self.T * self.O + 2) * self.N)  # first len(mission) * O * N actions are to assign tasks to systems, last 2*N actions are to select/deselect systems
-        # Example for using image as input:
-        self.observation_space = gym.spaces.Box(low=-2, high=2, shape=(self.state.state_dim(),), dtype=np.float32)  # Observation space is a vector of floats
 
-    def reset(self, seed: int | None = None, options: dict[str, Any] | None = None):
+        selected_system_mask = np.zeros(self.N, dtype=np.bool_)
+        selected_system_mask[architecture_indices] = True
+        self.selected_system_mask = selected_system_mask
+
+        self.state = State(self.selected_system_mask, self.mission)
+        assignment_shape = (self.T, self.O, self.N)
+        self.assignment_mask = np.zeros(assignment_shape, dtype=bool)
+        self.assignment_start_time = np.full(
+            assignment_shape,
+            np.inf,
+            dtype=np.float32,
+        )
+        self.assignment_finish_time = np.full(
+            assignment_shape,
+            np.inf,
+            dtype=np.float32,
+        )
+        self.system_indices_by_type: dict[int, list[int]] = {}
+        for sys_idx in architecture_indices:
+            func_type = int(FULL_SOS[sys_idx].func_type)
+            self.system_indices_by_type.setdefault(func_type, []).append(sys_idx)
+
+        self.action_space = gym.spaces.Discrete(self.T * self.O * self.N)
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(OBSERVATION_SIZE,),
+            dtype=np.float32,
+        )
+        self.refresh_derived_state()
+
+    def reset(
+        self,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ):
         super().reset(seed=seed)
-        # Reset the state of the environment to an initial state
-        self.state = State(self.arch, self.mission)  # Reset state with initial architecture and mission
-        self.step_count = 0
-        self.current_reward = 0.0
-        return self.state.to_obs(), {}  # Return initial observation
-    
-    def decode_action(self, action:int) -> tuple[int, int]:
-        assign_size = self.T * self.O * self.N
-        delete_sys = assign_size + self.N
+        self.state = State(self.selected_system_mask, self.mission)
+        self.refresh_derived_state()
+        return self.state.to_obs(), {}
 
-        if action < assign_size:
-            task_idx, op_idx, sys_idx = np.unravel_index(action, (self.T, self.O, self.N)) # Decode the action into task index, operation index, and system index, for example (30, 4, 22)
-            return {
-                "type": "assign_task",
-                "task_idx": task_idx,
-                "op_idx": op_idx,
-                "sys_idx": sys_idx
-            }
-        elif action < delete_sys:
-            sys_idx = action - assign_size
-            return {
-                "type": "select_system",
-                "sys_idx": sys_idx
-            }
-        else:
-            sys_idx = action - delete_sys
-            return {
-                "type": "deselect_system",
-                "sys_idx": sys_idx
-            }
+    def encode_assignment(self, task_idx: int, op_idx: int, sys_idx: int) -> int:
+        task_idx = int(task_idx)
+        op_idx = int(op_idx)
+        sys_idx = int(sys_idx)
+        if not 0 <= task_idx < self.T:
+            raise ValueError(f"task_idx out of range: {task_idx}")
+        if not 0 <= op_idx < self.O:
+            raise ValueError(f"op_idx out of range: {op_idx}")
+        if not 0 <= sys_idx < self.N:
+            raise ValueError(f"sys_idx out of range: {sys_idx}")
+        return (task_idx * self.O + op_idx) * self.N + sys_idx
 
-    def encode_action(self, act_type:str, task_idx=None, op_idx=None, sys_idx=None) -> int:
-        if act_type == "assign_task":
-            return np.ravel_multi_index((task_idx, op_idx, sys_idx), (self.T, self.O, self.N))
-        elif act_type == "select_system":
-            return self.T * self.O * self.N + sys_idx
-        elif act_type == "deselect_system":
-            return self.T * self.O * self.N + self.N + sys_idx
-        else:
-            raise ValueError(f"Unknown action type: {act_type}")
-    
-    def mask_invalid_actions(self):
-
-        # Create a mask for invalid actions based on the current state
-        select_mask = np.ones(self.N, dtype=np.float32)  # Start with all actions valid
-        deselect_mask = np.ones(self.N, dtype=np.float32)  # Start with all actions valid
-
-        # mask invalid select and deselect actions based on system selection and working status
-        for sys_idx in range(self.N):
-            if self.state.sys_sel_idx[sys_idx] != 0 :  # If the system is selected
-                select_mask[sys_idx] = 0  # Mask out the action to select this system
-                if self.state.sys_work_idx[sys_idx] == 1:  # If the system is currently working
-                    deselect_mask[sys_idx] = 0  # Mask out the action to deselect this system
-            else:
-                deselect_mask[sys_idx] = 0  # Mask out the action to deselect this system
-        
-        assign_mask = self.mask_invalid_assign()
-        mask = np.concatenate([assign_mask.reshape(-1), select_mask, deselect_mask])  # Combine the assign mask with the select/deselect mask   
-        return mask
-    
-    def mask_invalid_assign(self):
-        # Create a mask for invalid assign actions based on the current state
-        assign_mask = np.zeros((self.T, self.O, self.N), dtype=np.float32)  # Start with all actions invalid
-        for task_idx in range(self.T):
-            for op_idx in range(self.O):
-                if self.state.task_op_idx[task_idx] == op_idx:  # If the operation is available for assignment
-                    op = self.state.mission[task_idx].operations[op_idx]
-                    for sys_idx in range(self.N):
-                        if self.state.sys_sel_idx[sys_idx] != 0:  # If the system is selected
-                            sys = FULL_SOS[sys_idx]
-                            if sys.func_type == op.func_type:  # If the system function type is the type
-                                start_time = max(
-                                    self.state.current_time,
-                                    self.state.sys_availble_time[sys_idx],
-                                    self.state.op_release_time[task_idx, op_idx],
-                                )
-                                finish_time = start_time + op.duration
-
-                                if finish_time <= sys.available_until:  # If the system can finish the operation in its time window
-                                    assign_mask[task_idx, op_idx, sys_idx] = 1  # Mark the action as valid
-        return assign_mask
-
-    def apply_action(self, decoded_action: dict[str, Any]):
-        if decoded_action["type"] == "assign_task":
-            task_idx = decoded_action["task_idx"]
-            op_idx = decoded_action["op_idx"]
-            sys_idx = decoded_action["sys_idx"]
-            self.state.alocate_op2sys(task_idx, op_idx, sys_idx)
-        elif decoded_action["type"] == "select_system":
-            self.state.add_system(decoded_action["sys_idx"])
-        elif decoded_action["type"] == "deselect_system":
-            self.state.remove_system(decoded_action["sys_idx"])
-        # Implement action validation logic here
-
-    def step(self, action):
-        self.step_count += 1
-        if self.step_count > self.max_steps:  # Example truncation condition
-            return self.state.to_obs(), -10.0, False, True, {"valid": False, "dead_end": False, "info": "Step limit exceeded"}
-        
-        mask = self.mask_invalid_actions()
-        if mask[action] == 0: # Check if the action is invalid based on the current state
-            return self.state.to_obs(), -1.0, False, False, {"valid": False, "dead_end": False, "info": "Invalid action"}
-        
-        decoded_action = self.decode_action(action)
-
-        old_makespan = float(self.state.current_makespan)
-        self.apply_action(decoded_action)
-        obs = self.state.to_obs()
-        makespan_delta = max(0.0, float(self.state.current_makespan) - old_makespan)
-        reward = -makespan_delta / self.state.M
-        info = {
-            "valid": True,
-            "dead_end": False,
-            "decode_action": decoded_action,
-            "makespan": self.state.current_makespan,
-            "makespan_delta": makespan_delta,
-            "step_count": self.step_count,
+    def decode_assignment(self, action: int) -> dict[str, int]:
+        action = int(action)
+        if not self.action_space.contains(action):
+            raise ValueError(f"assignment action out of range: {action}")
+        task_idx, remainder = divmod(action, self.O * self.N)
+        op_idx, sys_idx = divmod(remainder, self.N)
+        return {
+            "task_idx": int(task_idx),
+            "op_idx": int(op_idx),
+            "sys_idx": int(sys_idx),
         }
 
-        terminated = np.all(self.state.task_op_idx == self.O)
-        if terminated:
-            return obs, float(reward), True, False, info
+    def assignment_times(
+        self,
+        task_idx: int,
+        op_idx: int,
+        sys_idx: int,
+    ) -> tuple[float, float] | None:
+        task_idx = int(task_idx)
+        op_idx = int(op_idx)
+        sys_idx = int(sys_idx)
+        if not (
+            0 <= task_idx < self.T
+            and 0 <= op_idx < self.O
+            and 0 <= sys_idx < self.N
+        ):
+            return None
+        if not self.assignment_mask[task_idx, op_idx, sys_idx]:
+            return None
+        return (
+            float(self.assignment_start_time[task_idx, op_idx, sys_idx]),
+            float(self.assignment_finish_time[task_idx, op_idx, sys_idx]),
+        )
 
-        truncated = self.step_count >= self.max_steps
-        if truncated:
-            return obs, float(reward - 10.0), False, True, info
+    def refresh_assignment_cache(self) -> np.ndarray:
+        assignment_shape = (self.T, self.O, self.N)
+        mask = np.zeros(assignment_shape, dtype=bool)
+        start_times = np.full(assignment_shape, np.inf, dtype=np.float32)
+        finish_times = np.full(assignment_shape, np.inf, dtype=np.float32)
 
-        dead_end = not np.any(self.mask_invalid_assign())
-        if dead_end:
-            unfinished_ops = self.T * self.O - int(self.state.task_op_idx.sum())
-            reward -= unfinished_ops / self.T
-            info["dead_end"] = True
-            return obs, float(reward), True, False, info
+        for task_idx in range(self.T):
+            op_idx = int(self.state.task_op_idx[task_idx])
+            if op_idx >= self.O:
+                continue
 
-        return obs, float(reward), False, False, info
+            operation = self.mission[task_idx].operations[op_idx]
+            operation_ready = float(
+                self.state.operation_ready_time[task_idx, op_idx]
+            )
+            for sys_idx in self.system_indices_by_type.get(
+                int(operation.func_type),
+                [],
+            ):
+                start_time = max(
+                    float(self.state.system_ready_time[sys_idx]),
+                    operation_ready,
+                )
+                finish_time = start_time + float(operation.duration)
+                if finish_time > float(FULL_SOS[sys_idx].available_until):
+                    continue
+                mask[task_idx, op_idx, sys_idx] = True
+                start_times[task_idx, op_idx, sys_idx] = start_time
+                finish_times[task_idx, op_idx, sys_idx] = finish_time
 
-    def render(self, mode='human'):
-        # Render the environment to the screen
-        pass
+        self.assignment_mask = mask
+        self.assignment_start_time = start_times
+        self.assignment_finish_time = finish_times
+        return self.assignment_mask
 
-    def close(self):
-        # Clean up resources
-        pass
+    def valid_assignment_mask(self) -> np.ndarray:
+        return self.assignment_mask
+
+    def valid_action_mask(self) -> np.ndarray:
+        return self.valid_assignment_mask().reshape(-1)
+
+    def refresh_derived_state(self) -> None:
+        state = self.state
+        state.task_candidate_mask.fill(False)
+        state.task_waiting_mask.fill(False)
+        state.task_earliest_start.fill(0.0)
+        state.task_remaining_time.fill(0.0)
+        state.task_ttd.fill(0.0)
+        state.task_slack.fill(0.0)
+        state.task_next_type_load.fill(0.0)
+        state.system_ready_delay.fill(0.0)
+
+        assignment_mask = self.refresh_assignment_cache()
+        feasible_tasks: list[int] = []
+        for task_idx in range(self.T):
+            op_idx = int(state.task_op_idx[task_idx])
+            if op_idx >= self.O:
+                continue
+
+            valid_systems = np.flatnonzero(assignment_mask[task_idx, op_idx] > 0)
+            if valid_systems.size == 0:
+                continue
+
+            earliest_start = float(
+                np.min(
+                    self.assignment_start_time[
+                        task_idx,
+                        op_idx,
+                        valid_systems,
+                    ]
+                )
+            )
+            estimated_current_finish = earliest_start + float(
+                state.op_duration[task_idx, op_idx]
+            )
+            state.task_remaining_time[task_idx] = float(
+                np.sum(state.op_duration[task_idx, op_idx + 1:])
+            )
+            state.task_candidate_mask[task_idx] = True
+            state.task_earliest_start[task_idx] = float(earliest_start)
+            state.task_ttd[task_idx] = float(
+                state.task_due_time[task_idx] - estimated_current_finish
+            )
+            state.task_slack[task_idx] = float(
+                state.task_ttd[task_idx] - state.task_remaining_time[task_idx]
+            )
+            feasible_tasks.append(task_idx)
+
+            next_op_idx = op_idx + 1
+            if next_op_idx >= self.O:
+                continue
+            next_type = self.mission[task_idx].operations[next_op_idx].func_type
+            matching_ready_times = [
+                float(state.system_ready_time[sys_idx])
+                for sys_idx in self.system_indices_by_type.get(int(next_type), [])
+            ]
+            if matching_ready_times:
+                state.task_next_type_load[task_idx] = float(
+                    np.mean(
+                        [
+                            max(ready_time - estimated_current_finish, 0.0)
+                            for ready_time in matching_ready_times
+                        ]
+                    )
+                )
+
+        if feasible_tasks:
+            frontier = min(
+                float(state.task_earliest_start[task_idx])
+                for task_idx in feasible_tasks
+            )
+            for task_idx in feasible_tasks:
+                if float(state.task_earliest_start[task_idx]) > frontier + 1e-9:
+                    state.task_waiting_mask[task_idx] = True
+            selected_indices = np.flatnonzero(self.selected_system_mask)
+            state.system_ready_delay[selected_indices] = np.maximum(
+                state.system_ready_time[selected_indices] - frontier,
+                0.0,
+            )
+
+    def allocate_assignment(self, task_idx: int, op_idx: int, sys_idx: int) -> None:
+        times = self.assignment_times(task_idx, op_idx, sys_idx)
+        if times is None:
+            raise ValueError(
+                f"infeasible assignment: task={task_idx}, op={op_idx}, system={sys_idx}"
+            )
+        start_time, finish_time = times
+        state = self.state
+        operation = self.mission[task_idx].operations[op_idx]
+        previous_system_ready = float(state.system_ready_time[sys_idx])
+
+        state.op_assign_sys[task_idx, op_idx] = sys_idx
+        state.op_start_time[task_idx, op_idx] = start_time
+        state.op_finish_time[task_idx, op_idx] = finish_time
+        state.system_idle_time[sys_idx] += max(
+            0.0,
+            start_time - previous_system_ready,
+        )
+        state.system_busy_time[sys_idx] += float(operation.duration)
+        state.system_ready_time[sys_idx] = finish_time
+        state.current_makespan = max(float(state.current_makespan), finish_time)
+
+        state.task_op_idx[task_idx] += 1
+        if int(state.task_op_idx[task_idx]) == self.O:
+            return
+
+        next_op_idx = op_idx + 1
+        state.operation_ready_time[task_idx, next_op_idx] = max(
+            float(state.operation_ready_time[task_idx, next_op_idx]),
+            finish_time,
+        )
+
+    def step(self, action: int):
+        try:
+            assignment = self.decode_assignment(action)
+        except (TypeError, ValueError):
+            info = {"valid": False, "success": False, "dead_end": False}
+            return self.state.to_obs(), -1.0, False, False, info
+
+        if not self.assignment_mask[
+            assignment["task_idx"],
+            assignment["op_idx"],
+            assignment["sys_idx"],
+        ]:
+            info = {"valid": False, "success": False, "dead_end": False}
+            return self.state.to_obs(), -1.0, False, False, info
+
+        old_makespan = float(self.state.current_makespan)
+        self.allocate_assignment(**assignment)
+        self.refresh_derived_state()
+        reward = -(float(self.state.current_makespan) - old_makespan) / self.state.M
+
+        success = bool(np.all(self.state.task_op_idx == self.O))
+        dead_end = not success and not np.any(self.assignment_mask)
+        info = {"valid": True, "success": success, "dead_end": dead_end}
+        return self.state.to_obs(), float(reward), success or dead_end, False, info

@@ -1,22 +1,27 @@
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from pathlib import Path
 import random
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from tqdm.auto import tqdm
 
 import env
+import hrule
+import rule
 import syn
 
 
 @dataclass
 class DQNConfig:
     episodes: int = 200
-    max_steps: int = 300
     scenario_pool_size: int = 20
     scenario_order: str = "random"
+    shared_mission: bool = False
+    rule_set: str = "standard"
     selected_system_num: int | tuple[int, int] | None = None
     min_system_num: int = 3
     max_system_num: int = 22
@@ -33,6 +38,14 @@ class DQNConfig:
     hidden_dim: int = 1024
     seed: int = 1
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def get_rule_class(rule_set):
+    if rule_set == "standard":
+        return rule.Rule
+    if rule_set == "huang":
+        return hrule.HRule
+    raise ValueError(f"Unknown rule set: {rule_set}")
 
 
 class ReplayBuffer:
@@ -76,6 +89,8 @@ class QNetwork(nn.Module):
 class DQNAgent:
     def __init__(self, obs_dim, action_dim, config):
         self.config = config
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
         self.device = torch.device(config.device)
         self.q_net = QNetwork(obs_dim, action_dim, config.hidden_dim).to(self.device)
         self.target_net = QNetwork(obs_dim, action_dim, config.hidden_dim).to(self.device)
@@ -84,12 +99,47 @@ class DQNAgent:
         self.replay = ReplayBuffer(config.buffer_size)
         self.learn_step = 0
 
+    def save_checkpoint(self, path, training_state=None):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint = {
+            "obs_dim": self.obs_dim,
+            "action_dim": self.action_dim,
+            "config": asdict(self.config),
+            "q_net_state_dict": self.q_net.state_dict(),
+            "target_net_state_dict": self.target_net.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "learn_step": self.learn_step,
+            "training_state": training_state or {},
+        }
+        torch.save(checkpoint, path)
+        return path
+
+    @classmethod
+    def load_checkpoint(cls, path, device=None, load_optimizer=True):
+        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+
+        config_values = dict(checkpoint["config"])
+        config_values["device"] = str(device)
+        agent = cls(
+            obs_dim=int(checkpoint["obs_dim"]),
+            action_dim=int(checkpoint["action_dim"]),
+            config=DQNConfig(**config_values),
+        )
+        agent.q_net.load_state_dict(checkpoint["q_net_state_dict"])
+        agent.target_net.load_state_dict(checkpoint["target_net_state_dict"])
+        if load_optimizer:
+            agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        agent.learn_step = int(checkpoint["learn_step"])
+        return agent, checkpoint
+
     def select_action(self, obs, action_mask, epsilon):
         valid_actions = np.flatnonzero(action_mask > 0)
         if len(valid_actions) == 0:
-            raise ValueError("No valid op action.")
+            raise ValueError("No valid rule action.")
 
-        if random.random() < epsilon:
+        if epsilon > 0.0 and random.random() < epsilon:
             return int(random.choice(valid_actions))
 
         obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -100,9 +150,7 @@ class DQNAgent:
         return int(q_values.argmax(dim=1).item())
 
     def learn(self):
-        if len(self.replay) < self.config.min_buffer_size:
-            return None
-        if len(self.replay) < self.config.batch_size:
+        if len(self.replay) < max(self.config.min_buffer_size, self.config.batch_size):
             return None
 
         obs, action, reward, next_obs, done, next_mask = self.replay.sample(self.config.batch_size)
@@ -144,18 +192,26 @@ class ScenarioPool:
         max_system_num=None,
         cost_limit=None,
         max_attempts=1000,
+        shared_mission=False,
+        mission=None,
     ):
         self.selected_system_num = selected_system_num
         self.min_system_num = max(min_system_num, len(syn.CONFIG.get("funcs", {})))
         self.max_system_num = len(env.FULL_SOS) if max_system_num is None else max_system_num
         self.cost_limit = syn.CONFIG.get("cost_limit") if cost_limit is None else cost_limit
+        self.min_coverage_until = float(syn.CONFIG.get("min_coverage_until", 600))
         self.max_attempts = max_attempts
+        self.mission = mission
+        if self.mission is None and shared_mission:
+            self.mission = syn.build_mission_from_config(syn.CONFIG)
         self.scenarios = []
 
         for _ in range(size):
-            mission = syn.build_mission_from_config(syn.CONFIG)
-            arch = self.sample_arch(mission)
-            self.scenarios.append((arch, mission))
+            scenario_mission = self.mission
+            if scenario_mission is None:
+                scenario_mission = syn.build_mission_from_config(syn.CONFIG)
+            arch = self.sample_arch(scenario_mission)
+            self.scenarios.append((arch, scenario_mission))
 
     def sample_system_num(self):
         if self.selected_system_num is None:
@@ -167,7 +223,7 @@ class ScenarioPool:
 
     def sample_arch(self, mission):
         for _ in range(self.max_attempts):
-            arch = syn.random_select_sos(self.sample_system_num(), syn.CONFIG)
+            arch = syn.random_select_sos(self.sample_system_num())
             if self.cost_limit is not None and sum(s.cost for s in arch) > self.cost_limit:
                 continue
             if self.arch_can_cover_mission(arch, mission):
@@ -176,8 +232,13 @@ class ScenarioPool:
 
     def arch_can_cover_mission(self, arch, mission):
         for func_name in syn.CONFIG.get("funcs", {}):
-            func_type = syn.func_type2idx.get(func_name, 0)
-            capacity = sum(s.available_until - s.available_from for s in arch if s.func_type == func_type)
+            func_type = syn.func_type2idx[func_name]
+            matching_systems = [s for s in arch if s.func_type == func_type]
+            if not matching_systems:
+                return False
+            if max(s.available_until for s in matching_systems) < self.min_coverage_until:
+                return False
+            capacity = sum(s.available_until - s.available_from for s in matching_systems)
             demand = sum(op.duration for task in mission for op in task.operations if op.func_type == func_type)
             if capacity < demand:
                 return False
@@ -202,80 +263,32 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
 
 
-def op_action_mask(mission_env):
-    assign_mask = mission_env.mask_invalid_assign()
-    return assign_mask.max(axis=2).reshape(-1).astype(np.float32)
+def rule_action_mask(mission_env, rule_num):
+    if np.any(mission_env.valid_assignment_mask()):
+        return np.ones(rule_num, dtype=np.float32)
+    return np.zeros(rule_num, dtype=np.float32)
 
 
-def cssa(mission_env, task_idx, op_idx, sys_indices):
-    op = mission_env.state.mission[task_idx].operations[op_idx]
-    candidates = []
-    for sys_idx in sys_indices:
-        start_time = max(
-            float(mission_env.state.current_time),
-            float(mission_env.state.sys_availble_time[sys_idx]),
-            float(mission_env.state.op_release_time[task_idx, op_idx]),
-        )
-        finish_time = start_time + float(op.duration)
-        if finish_time > float(env.FULL_SOS[sys_idx].available_until):
-            continue
-        candidates.append(
-            (
-                start_time,
-                finish_time,
-                float(mission_env.state.sys_busy_time[sys_idx]),
-                int(sys_idx),
-            )
-        )
-
-    if not candidates:
-        raise ValueError(f"No feasible system for task={task_idx}, op={op_idx}.")
-
-    _, _, _, sys_idx = min(candidates)
-    return sys_idx
-
-
-def op_action_to_env_action(mission_env, op_action):
-    task_idx, op_idx = np.unravel_index(int(op_action), (mission_env.T, mission_env.O))
-    assign_mask = mission_env.mask_invalid_assign()
-    sys_indices = np.flatnonzero(assign_mask[task_idx, op_idx] > 0)
-    if len(sys_indices) == 0:
-        raise ValueError(f"No feasible system for task={task_idx}, op={op_idx}.")
-
-    sys_idx = cssa(mission_env, int(task_idx), int(op_idx), sys_indices)
-    env_action = mission_env.encode_action(
-        "assign_task",
-        task_idx=int(task_idx),
-        op_idx=int(op_idx),
-        sys_idx=int(sys_idx),
-    )
-    return int(env_action), int(task_idx), int(op_idx), int(sys_idx)
-
-
-def step_op_action(mission_env, op_action):
-    env_action, task_idx, op_idx, sys_idx = op_action_to_env_action(mission_env, op_action)
-    next_obs, reward, terminated, truncated, info = mission_env.step(env_action)
-    info["op_action"] = int(op_action)
-    info["env_action"] = int(env_action)
-    info["task_idx"] = task_idx
-    info["op_idx"] = op_idx
-    info["sys_idx"] = sys_idx
-    return next_obs, float(reward), bool(terminated), bool(truncated), info
+def step_rule_action(mission_env, rule_policy, rule_action):
+    env_action = rule_policy.to_env_action(rule_action)
+    return mission_env.step(env_action)
 
 
 def train_dqn(config, scenario_pool):
     set_seed(config.seed)
+    rule_class = get_rule_class(config.rule_set)
 
     _, arch, mission = scenario_pool.get(0)
     mission_env = env.MissionEnv(arch, mission)
     obs_dim = mission_env.observation_space.shape[0]
-    action_dim = mission_env.T * mission_env.O
+    action_dim = rule_class.RULE_NUM
     agent = DQNAgent(obs_dim, action_dim, config)
 
     epsilon = config.epsilon_start
     history = []
 
-    for episode in range(config.episodes):
+    progress = tqdm(range(config.episodes), desc="Training", unit="episode")
+    for episode in progress:
         if config.scenario_order == "random":
             scenario_idx, arch, mission = scenario_pool.sample()
         elif config.scenario_order == "sequential":
@@ -284,29 +297,26 @@ def train_dqn(config, scenario_pool):
             raise ValueError(f"Unknown scenario_order: {config.scenario_order}")
 
         mission_env = env.MissionEnv(arch, mission)
+        rule_policy = rule_class(mission_env)
         obs, _ = mission_env.reset()
         total_reward = 0.0
+        rule_counts = np.zeros(rule_class.RULE_NUM, dtype=np.int32)
         last_loss = None
         terminated = False
-        truncated = False
-        info = {"dead_end": False, "valid": True}
+        info = {"success": False, "dead_end": False}
 
-        for step in range(config.max_steps):
-            mask = op_action_mask(mission_env)
-            if not np.any(mask):
-                next_obs = mission_env.state.to_obs()
-                reward = -1.0
-                terminated = True
-                truncated = False
-                info = {"dead_end": True, "valid": False, "info": "No valid op action."}
-                op_action = 0
-            else:
-                op_action = agent.select_action(obs, mask, epsilon)
-                next_obs, reward, terminated, truncated, info = step_op_action(mission_env, op_action)
+        for _ in range(mission_env.T * mission_env.O):
+            mask = rule_action_mask(mission_env, rule_class.RULE_NUM)
+            rule_action = agent.select_action(obs, mask, epsilon)
+            rule_counts[rule_action] += 1
+            next_obs, reward, terminated, _, info = step_rule_action(
+                mission_env,
+                rule_policy,
+                rule_action,
+            )
 
-            done = terminated or truncated
-            next_mask = op_action_mask(mission_env)
-            agent.replay.add(obs, op_action, reward, next_obs, done, next_mask)
+            next_mask = rule_action_mask(mission_env, rule_class.RULE_NUM)
+            agent.replay.add(obs, rule_action, reward, next_obs, terminated, next_mask)
 
             loss = agent.learn()
             if loss is not None:
@@ -314,7 +324,7 @@ def train_dqn(config, scenario_pool):
 
             obs = next_obs
             total_reward += reward
-            if done:
+            if terminated:
                 break
 
         epsilon = max(config.epsilon_end, epsilon * config.epsilon_decay)
@@ -324,62 +334,73 @@ def train_dqn(config, scenario_pool):
             "scenario_sos": len(arch),
             "scenario_cost": sum(s.cost for s in arch),
             "reward": float(total_reward),
-            "steps": step + 1,
-            "done": bool(terminated or truncated),
-            "terminated": bool(terminated),
-            "truncated": bool(truncated),
             "dead_end": bool(info.get("dead_end", False)),
+            "success": bool(info.get("success", False)),
             "makespan": float(mission_env.state.current_makespan),
-            "done_ops": int(mission_env.state.task_op_idx.sum()),
+            "assigned_ops": int(mission_env.state.task_op_idx.sum()),
             "epsilon": float(epsilon),
             "loss": last_loss,
             "replay_size": len(agent.replay),
         }
+        for rule_idx, rule_name in enumerate(rule_class.RULE_NAMES):
+            row[f"rule_{rule_name.lower()}_count"] = int(rule_counts[rule_idx])
         history.append(row)
 
-        if episode == 0 or (episode + 1) % 10 == 0:
-            print(row)
+        progress.set_postfix(
+            reward=f"{total_reward:.3f}",
+            makespan=f"{mission_env.state.current_makespan:.1f}",
+            assigned_ops=int(mission_env.state.task_op_idx.sum()),
+            epsilon=f"{epsilon:.3f}",
+            loss="-" if last_loss is None else f"{last_loss:.4f}",
+        )
 
     return agent, history
 
 
-def evaluate_dqn(agent, scenario_pool, episodes, max_steps, collect_schedule=False):
+def evaluate_dqn(agent, scenario_pool, episodes, collect_schedule=False):
+    rule_class = get_rule_class(agent.config.rule_set)
+    if agent.action_dim != rule_class.RULE_NUM:
+        raise ValueError(
+            f"Checkpoint action dimension {agent.action_dim} does not match "
+            f"rule set '{agent.config.rule_set}' with {rule_class.RULE_NUM} actions."
+        )
+
     results = []
     for episode in range(episodes):
         scenario_idx, arch, mission = scenario_pool.get(episode)
         mission_env = env.MissionEnv(arch, mission)
+        rule_policy = rule_class(mission_env)
         obs, _ = mission_env.reset()
         total_reward = 0.0
+        rule_counts = np.zeros(rule_class.RULE_NUM, dtype=np.int32)
         terminated = False
-        truncated = False
-        info = {"dead_end": False, "valid": True}
+        info = {"success": False, "dead_end": False}
 
-        for step in range(max_steps):
-            mask = op_action_mask(mission_env)
-            if not np.any(mask):
-                reward = -1.0
-                terminated = True
-                truncated = False
-                info = {"dead_end": True, "valid": False, "info": "No valid op action."}
-            else:
-                op_action = agent.select_action(obs, mask, epsilon=0.0)
-                obs, reward, terminated, truncated, info = step_op_action(mission_env, op_action)
+        for _ in range(mission_env.T * mission_env.O):
+            mask = rule_action_mask(mission_env, rule_class.RULE_NUM)
+            rule_action = agent.select_action(obs, mask, epsilon=0.0)
+            rule_counts[rule_action] += 1
+            obs, reward, terminated, _, info = step_rule_action(
+                mission_env,
+                rule_policy,
+                rule_action,
+            )
 
             total_reward += reward
-            if terminated or truncated:
+            if terminated:
                 break
 
         result = {
             "episode": episode,
             "scenario_idx": scenario_idx,
             "reward": float(total_reward),
-            "steps": step + 1,
             "makespan": float(mission_env.state.current_makespan),
-            "done_ops": int(mission_env.state.task_op_idx.sum()),
-            "terminated": bool(terminated),
-            "truncated": bool(truncated),
+            "assigned_ops": int(mission_env.state.task_op_idx.sum()),
             "dead_end": bool(info.get("dead_end", False)),
+            "success": bool(info.get("success", False)),
         }
+        for rule_idx, rule_name in enumerate(rule_class.RULE_NAMES):
+            result[f"rule_{rule_name.lower()}_count"] = int(rule_counts[rule_idx])
         if collect_schedule:
             result["schedule"] = schedule_rows(mission_env, episode, scenario_idx)
         results.append(result)
@@ -390,7 +411,7 @@ def evaluate_dqn(agent, scenario_pool, episodes, max_steps, collect_schedule=Fal
 def schedule_rows(mission_env, episode, scenario_idx):
     rows = []
     for task_idx in range(mission_env.T):
-        task = mission_env.state.mission[task_idx]
+        task = mission_env.mission[task_idx]
         for op_idx in range(mission_env.O):
             sys_idx = int(mission_env.state.op_assign_sys[task_idx, op_idx])
             if sys_idx < 0:
@@ -403,7 +424,7 @@ def schedule_rows(mission_env, episode, scenario_idx):
                     "task_name": task.name,
                     "op_idx": int(op_idx),
                     "op_name": task.operations[op_idx].name,
-                    "func_type": float(task.operations[op_idx].func_type),
+                    "func_type": int(task.operations[op_idx].func_type),
                     "sys_idx": sys_idx,
                     "sys_name": env.FULL_SOS[sys_idx].name,
                     "start_time": float(mission_env.state.op_start_time[task_idx, op_idx]),

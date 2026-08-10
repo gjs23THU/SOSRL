@@ -5,6 +5,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import dqn
+import syn
 
 
 def parse_selected_system_num(value):
@@ -19,11 +20,25 @@ def parse_selected_system_num(value):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=100)
-    parser.add_argument("--max-steps", type=int, default=300)
     parser.add_argument("--scenario-pool-size", type=int, default=20)
     parser.add_argument("--scenario-order", choices=["random", "sequential"], default="random")
+    parser.add_argument(
+        "--rule-set",
+        choices=["standard", "huang"],
+        default="standard",
+    )
+    parser.add_argument(
+        "--shared-mission",
+        action="store_true",
+        help="Reuse one mission across training architectures only.",
+    )
     parser.add_argument("--eval-episodes", type=int, default=5)
-    parser.add_argument("--eval-on-train", action="store_true")
+    parser.add_argument(
+        "--eval-seed",
+        type=int,
+        default=20260724,
+        help="Seed for the independent evaluation pool.",
+    )
     parser.add_argument("--selected-system-num", type=str, default="none")
     parser.add_argument("--min-system-num", type=int, default=3)
     parser.add_argument("--max-system-num", type=int, default=22)
@@ -81,13 +96,35 @@ def save_outputs(output_dir, config, history, eval_results):
     print(f"logs saved to: {output_dir}")
 
 
+def print_training_parameters(args, config, output_dir):
+    rule_class = dqn.get_rule_class(config.rule_set)
+    parameters = {
+        "training": asdict(config),
+        "evaluation": {
+            "eval_episodes": args.eval_episodes,
+            "eval_seed": args.eval_seed,
+            "independent_from_training": True,
+            "shared_mission": False,
+        },
+        "output": {
+            "output_dir": str(output_dir),
+            "checkpoint": str(output_dir / "model.pt"),
+        },
+        "environment": syn.CONFIG,
+        "rule_actions": list(rule_class.RULE_NAMES),
+    }
+    print("training parameters:")
+    print(json.dumps(parameters, ensure_ascii=False, indent=2))
+
+
 def main():
     args = parse_args()
     config = dqn.DQNConfig(
         episodes=args.episodes,
-        max_steps=args.max_steps,
         scenario_pool_size=args.scenario_pool_size,
         scenario_order=args.scenario_order,
+        shared_mission=args.shared_mission,
+        rule_set=args.rule_set,
         selected_system_num=parse_selected_system_num(args.selected_system_num),
         min_system_num=args.min_system_num,
         max_system_num=args.max_system_num,
@@ -105,6 +142,10 @@ def main():
         seed=args.seed,
     )
 
+    run_name = args.run_name or f"{config.rule_set}_seed_{config.seed}"
+    output_dir = Path(args.log_dir) / run_name
+    print_training_parameters(args, config, output_dir)
+
     dqn.set_seed(config.seed)
     train_pool = dqn.ScenarioPool(
         size=config.scenario_pool_size,
@@ -112,34 +153,45 @@ def main():
         min_system_num=config.min_system_num,
         max_system_num=config.max_system_num,
         cost_limit=config.cost_limit,
+        shared_mission=config.shared_mission,
     )
-    eval_pool = train_pool
-    if not args.eval_on_train:
-        eval_pool = dqn.ScenarioPool(
-            size=args.eval_episodes,
-            selected_system_num=config.selected_system_num,
-            min_system_num=config.min_system_num,
-            max_system_num=config.max_system_num,
-            cost_limit=config.cost_limit,
-        )
 
     agent, history = dqn.train_dqn(config, train_pool)
-    best_episode = max(history, key=lambda row: (row["done_ops"], -row["makespan"]))
+    checkpoint_path = agent.save_checkpoint(
+        output_dir / "model.pt",
+        training_state={
+            "episodes_completed": len(history),
+            "epsilon": history[-1]["epsilon"] if history else config.epsilon_start,
+        },
+    )
+    print(f"model saved to: {checkpoint_path}")
+
+    best_episode = max(history, key=lambda row: (row["assigned_ops"], -row["makespan"]))
     print("best train episode:", best_episode)
 
+    # Evaluation always uses newly generated missions and architectures. Resetting
+    # the RNG here makes the test pool independent of training-pool size and lets
+    # separately trained models use exactly the same scenarios with --eval-seed.
+    dqn.set_seed(args.eval_seed)
+    eval_pool = dqn.ScenarioPool(
+        size=args.eval_episodes,
+        selected_system_num=config.selected_system_num,
+        min_system_num=config.min_system_num,
+        max_system_num=config.max_system_num,
+        cost_limit=config.cost_limit,
+        shared_mission=False,
+    )
     eval_results = dqn.evaluate_dqn(
         agent,
         eval_pool,
         episodes=args.eval_episodes,
-        max_steps=config.max_steps,
         collect_schedule=True,
     )
     print("eval results:")
     for result in eval_results:
         print({key: value for key, value in result.items() if key != "schedule"})
 
-    run_name = args.run_name or f"seed_{config.seed}"
-    save_outputs(Path(args.log_dir) / run_name / "op", config, history, eval_results)
+    save_outputs(output_dir, config, history, eval_results)
 
 
 if __name__ == "__main__":
