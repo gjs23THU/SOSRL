@@ -406,9 +406,13 @@ Scheduler DQN 输出 4 个调度规则 Q 值：
 
 - `net_cost`：初始成本和 ADD 收费减去 REMOVE 退款；
 - `active_cost`：当前 active systems 的标价之和；
-- `total_refund`：累计退款。
+- `gross_charge`：初始投入加全部 ADD 收费，不扣退款；
+- `total_refund`：累计退款；
+- `peak_net_cost`、`peak_active_cost`：mission 构造过程中曾达到的最高成本；
+- `ever_over_budget`：任意构造步是否出现过 `net_cost > B`；
+- `final_over_budget`：终止状态是否超预算。
 
-当前环境没有单独保存累计原始投入 `gross_charge`。如果需要，可计算：
+环境在每个 episode 开始时保存 initial cost，在每次 ADD、REMOVE、REPLACE 后更新峰值和超预算标志。累计投入满足：
 
 \[
 gross\ charge=initial\ cost+\sum ADD\ cost.
@@ -522,18 +526,18 @@ r_t^A=
 
 预算使用势函数差，因此策略离开超预算区时会获得相反方向的势差反馈。该设计鼓励回到预算内，但不保证整个轨迹从未超过预算。
 
-当前正式评估中的 `budget_violation` 只检查最终：
+评估同时输出两种预算口径：
+
+- `budget_violation` / `final_over_budget` 检查最终：
 
 \[
 net\ cost_{terminal}>B.
 \]
 
-如果研究要求“全过程从不超过预算”，还需要增加：
+- `ever_over_budget` 检查完整构造轨迹；
+- `peak_net_cost` 和 `peak_active_cost` 给出轨迹峰值。
 
-- `peak_net_cost`；
-- `peak_active_cost`；
-- `ever_over_budget`；
-- 硬预算 action mask 或约束强化学习方法。
+这些指标能够揭示“过程中超过 8000、最终通过 REMOVE 回到预算内”的 mission。它们仍然是评估指标；如果要求策略从不越界，还需要硬预算 action mask 或约束强化学习方法。
 
 ---
 
@@ -750,7 +754,11 @@ while mission 未完成：
 - makespan；
 - 最终 `net_cost`；
 - 最终 `active_cost`；
+- `initial_net_cost` 与 `peak_net_cost`；
+- `initial_active_cost` 与 `peak_active_cost`；
+- `gross_charge`；
 - `total_refund`；
+- `ever_over_budget` 与 `final_over_budget`；
 - architecture change count；
 - 六条架构规则计数；
 - 四条调度规则计数。
@@ -786,7 +794,7 @@ while mission 未完成：
 5. 平均体系变化次数；
 6. 平均退款额。
 
-建议补充的成本指标：
+当前已经输出的全过程成本指标：
 
 1. `peak_net_cost`；
 2. `peak_active_cost`；
@@ -825,10 +833,12 @@ while mission 未完成：
 ### 16.1 预训练 Scheduler
 
 ```powershell
-python hrlmain.py pretrain-scheduler `
+python -m sosrl train-scheduler `
   --episodes 1000 `
   --scenario-pool-size 100 `
-  --budget 8000 `
+  --rule-set standard `
+  --cost-limit 8000 `
+  --lr 0.001 `
   --hidden-dim 128 `
   --seed 4 `
   --device cuda `
@@ -838,7 +848,7 @@ python hrlmain.py pretrain-scheduler `
 ### 16.2 训练 Architecture
 
 ```powershell
-python hrlmain.py train-architecture `
+python -m sosrl train-architecture `
   --scheduler-checkpoint runs/hrl_scheduler_seed4/scheduler.pt `
   --episodes 1000 `
   --scenario-pool-size 100 `
@@ -869,7 +879,7 @@ python hrlmain.py train-architecture `
 ### 16.3 交替微调
 
 ```powershell
-python hrlmain.py finetune `
+python -m sosrl finetune `
   --scheduler-checkpoint runs/hrl_scheduler_seed4/scheduler.pt `
   --architecture-checkpoint runs/hrl_architecture_seed4/architecture.pt `
   --episodes 500 `
@@ -882,12 +892,25 @@ python hrlmain.py finetune `
 ### 16.4 配对评估
 
 ```powershell
-python hrlmain.py evaluate `
+python -m sosrl evaluate `
   --checkpoint runs/hrl_architecture_seed4/hrl.pt `
   --eval-episodes 100 `
   --eval-seed 20260724 `
   --device cuda `
   --output-dir runs/hrl_evaluation_seed4
+```
+
+### 16.5 扁平基线与 Scheduler 配对比较
+
+```powershell
+python -m sosrl train-flat --episodes 1000 --seed 1
+
+python -m sosrl compare-schedulers `
+  --model SIG=runs/SIG1000_standard_seed4/model.pt `
+  --model MIG=runs/MIG1000/model.pt `
+  --model MEG=runs/MEG1000/model.pt `
+  --eval-episodes 100 `
+  --eval-seed 20260724
 ```
 
 ---
@@ -898,8 +921,10 @@ python hrlmain.py evaluate `
 
 ```text
 scheduler.pt
-scheduler_history.csv
-scheduler_config.json
+train_history.csv
+eval_results.csv
+eval_schedule.csv
+config.json
 ```
 
 ### Architecture 训练
@@ -958,18 +983,29 @@ evaluation_manifest.json
 
 | 算法组成                                      | 实现文件                                     |
 | --------------------------------------------- | -------------------------------------------- |
-| mission 和候选系统生成                        | `syn.py`、`config.json`                  |
-| 统一静态/动态环境                             | `env.py`                                   |
-| 四条 Scheduler 规则与 CSSA                    | `rule.py`                                  |
-| 六条 Architecture 规则                        | `archrule.py`                              |
-| Scheduler DQN 和一步 replay                   | `dqn.py`                                   |
-| Architecture DQN、5-step replay、双层 episode | `hrldqn.py`                                |
-| 训练和评估命令                                | `hrlmain.py`                               |
-| 扁平 IntDQN 基线                              | `intenv.py`、`intdqn.py`、`intmain.py` |
-| 环境与算法测试                                | `tests/`                                   |
+| mission、system 与场景数据                    | `sosrl/domain.py`、`config.json`             |
+| 统一静态/动态 HRL 环境                        | `sosrl/environment.py`                       |
+| Scheduler、Huang 与 Architecture 规则         | `sosrl/rules/`                               |
+| 网络、Replay、配置与 checkpoint               | `sosrl/rl/`                                  |
+| 场景、episode、训练与评估                     | `sosrl/workflows/`                           |
+| 扁平 IntDQN 对照                              | `sosrl/baselines/`                           |
+| 六个统一命令                                  | `sosrl/cli.py`、`sosrl/__main__.py`          |
+| 绘图和成本轨迹报告                            | `scripts/`                                   |
+| 环境与算法测试                                | `tests/`                                     |
 
 运行全部测试：
 
 ```powershell
 python -m unittest discover -s tests -v
 ```
+
+固定 seed4 行为与 CPU 性能回归：
+
+```powershell
+python -m scripts.benchmark_hrl `
+  --checkpoint runs/hrl_budget20_seed4/architecture_1000/hrl.pt `
+  --expected tests/fixtures/seed4_hrl_regression.json `
+  --max-seconds 4.97
+```
+
+训练曲线和全过程成本事件报告分别由 `scripts.plot_history` 与 `scripts.report_cost_trajectory` 从 `runs/` 中重建；生成内容写入被 Git 忽略的 `reports/` 或 `outputs/`。

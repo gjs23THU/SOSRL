@@ -1,0 +1,83 @@
+[
+  {
+    "scenario_hash": "8a9b413ba5f89d424423d0794684a4a68552c12286204190fb05b4428ddc23b4",
+    "category": "capacity_tight",
+    "success": true,
+    "dead_end": false,
+    "makespan": 593.0,
+    "net_cost": 3168.6000000000004,
+    "active_cost": 1173.0,
+    "total_refund": 7982.4,
+    "architecture_changes": 27,
+    "budget_violation": false,
+    "assigned_ops": 120,
+    "architecture_rule_counts": {
+      "arch_keep_count": 93,
+      "arch_add_capability_count": 0,
+      "arch_add_capacity_count": 9,
+      "arch_add_window_count": 0,
+      "arch_remove_redundant_count": 3,
+      "arch_replace_inefficient_count": 15
+    },
+    "scheduler_rule_counts": {
+      "schedule_spt_count": 19,
+      "schedule_winq_count": 78,
+      "schedule_cr_count": 20,
+      "schedule_ms_count": 3
+    }
+  },
+  {
+    "scenario_hash": "7f0acf07c6fead626dfd5126d9bbce3ec9aa7d9831f84d1bc9bd36f12c28f56f",
+    "category": "feasible_suboptimal",
+    "success": true,
+    "dead_end": false,
+    "makespan": 576.0,
+    "net_cost": 4124.0,
+    "active_cost": 1978.0,
+    "total_refund": 8584.0,
+    "architecture_changes": 15,
+    "budget_violation": false,
+    "assigned_ops": 120,
+    "architecture_rule_counts": {
+      "arch_keep_count": 105,
+      "arch_add_capability_count": 0,
+      "arch_add_capacity_count": 2,
+      "arch_add_window_count": 1,
+      "arch_remove_redundant_count": 7,
+      "arch_replace_inefficient_count": 5
+    },
+    "scheduler_rule_counts": {
+      "schedule_spt_count": 30,
+      "schedule_winq_count": 42,
+      "schedule_cr_count": 48,
+      "schedule_ms_count": 0
+    }
+  },
+  {
+    "scenario_hash": "39eb3ec6f933d24edcec52ec9d7e71c39d83cbf740a6be6134defe0106f6947d",
+    "category": "feasible_suboptimal",
+    "success": true,
+    "dead_end": false,
+    "makespan": 638.0,
+    "net_cost": 3554.0,
+    "active_cost": 1708.0,
+    "total_refund": 7384.0,
+    "architecture_changes": 10,
+    "budget_violation": false,
+    "assigned_ops": 120,
+    "architecture_rule_counts": {
+      "arch_keep_count": 110,
+      "arch_add_capability_count": 0,
+      "arch_add_capacity_count": 0,
+      "arch_add_window_count": 0,
+      "arch_remove_redundant_count": 6,
+      "arch_replace_inefficient_count": 4
+    },
+    "scheduler_rule_counts": {
+      "schedule_spt_count": 9,
+      "schedule_winq_count": 57,
+      "schedule_cr_count": 53,
+      "schedule_ms_count": 1
+    }
+  }
+]

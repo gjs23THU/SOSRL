@@ -2,8 +2,8 @@ import unittest
 
 import numpy as np
 
-import intenv
-import syn
+from sosrl import domain as syn
+from sosrl.baselines import flat_environment as intenv
 
 
 class IntegratedEnvironmentTests(unittest.TestCase):

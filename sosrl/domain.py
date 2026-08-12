@@ -5,7 +5,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any
 
-CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+CONFIG_PATH = Path(__file__).resolve().parent.parent / "config.json"
 
 
 def load_config(path: str | PathLike[str] = CONFIG_PATH) -> dict[str, Any]:

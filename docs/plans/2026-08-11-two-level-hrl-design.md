@@ -42,10 +42,10 @@ training, then 8:2 alternating architecture/scheduler fine-tuning.
 ## Commands
 
 ```text
-python hrlmain.py pretrain-scheduler
-python hrlmain.py train-architecture --scheduler-checkpoint PATH
-python hrlmain.py finetune --scheduler-checkpoint PATH --architecture-checkpoint PATH
-python hrlmain.py evaluate --checkpoint PATH
+python -m sosrl train-scheduler
+python -m sosrl train-architecture --scheduler-checkpoint PATH
+python -m sosrl finetune --scheduler-checkpoint PATH --architecture-checkpoint PATH
+python -m sosrl evaluate --checkpoint PATH
 ```
 
 Evaluation uses one unseen, paired scenario pool for HRL, the static initial

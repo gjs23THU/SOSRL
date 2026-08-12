@@ -3,13 +3,25 @@ from typing import Any
 import gymnasium as gym
 import numpy as np
 
-import syn
+from . import domain as syn
 
 
 FULL_SOS = syn.FULL_SOS
 N = len(FULL_SOS)
 OBSERVATION_SIZE = 25
 ARCHITECTURE_ACTION_SIZE = 6
+SYSTEM_FUNC_TYPES = np.asarray(
+    [int(system.func_type) for system in FULL_SOS],
+    dtype=np.int32,
+)
+SYSTEM_AVAILABLE_FROM = np.asarray(
+    [float(system.available_from) for system in FULL_SOS],
+    dtype=np.float32,
+)
+SYSTEM_AVAILABLE_UNTIL = np.asarray(
+    [float(system.available_until) for system in FULL_SOS],
+    dtype=np.float32,
+)
 
 
 class State:
@@ -173,10 +185,12 @@ class MissionEnv(gym.Env):
         self.used_system_mask = np.zeros(self.N, dtype=np.bool_)
         self.net_cost = self._mask_cost(self.active_system_mask)
         self.active_cost = self.net_cost
-        self.total_refund = 0.0
+        self._reset_cost_tracking()
         self.architecture_change_count = 0
         self.steps_since_change = 0
         self.decision_version = 0
+        self._candidate_finish_cache_version: int | None = None
+        self._candidate_finish_cache: np.ndarray | None = None
         assignment_shape = (self.T, self.O, self.N)
         self.assignment_mask = np.zeros(assignment_shape, dtype=bool)
         self.assignment_start_time = np.full(
@@ -223,10 +237,12 @@ class MissionEnv(gym.Env):
         self.used_system_mask = np.zeros(self.N, dtype=np.bool_)
         self.net_cost = self._mask_cost(self.active_system_mask)
         self.active_cost = self.net_cost
-        self.total_refund = 0.0
+        self._reset_cost_tracking()
         self.architecture_change_count = 0
         self.steps_since_change = 0
         self.decision_version += 1
+        self._candidate_finish_cache_version = None
+        self._candidate_finish_cache = None
         self._rebuild_system_indices_by_type()
         self.refresh_derived_state()
         return self.schedule_observation(), {}
@@ -236,6 +252,40 @@ class MissionEnv(gym.Env):
         return float(
             sum(FULL_SOS[index].cost for index in np.flatnonzero(mask))
         )
+
+    def _reset_cost_tracking(self) -> None:
+        self.initial_net_cost = float(self.net_cost)
+        self.initial_active_cost = float(self.active_cost)
+        self.peak_net_cost = float(self.net_cost)
+        self.peak_active_cost = float(self.active_cost)
+        self.gross_charge = float(self.net_cost)
+        self.total_refund = 0.0
+        self.ever_over_budget = bool(self.net_cost > self.budget)
+
+    def _record_cost_state(self) -> None:
+        self.peak_net_cost = max(self.peak_net_cost, float(self.net_cost))
+        self.peak_active_cost = max(
+            self.peak_active_cost,
+            float(self.active_cost),
+        )
+        self.ever_over_budget = bool(
+            self.ever_over_budget or self.net_cost > self.budget
+        )
+
+    def cost_metrics(self) -> dict[str, float | bool]:
+        """Return initial, final, and peak cost values for this mission."""
+        return {
+            "initial_net_cost": float(self.initial_net_cost),
+            "final_net_cost": float(self.net_cost),
+            "peak_net_cost": float(self.peak_net_cost),
+            "initial_active_cost": float(self.initial_active_cost),
+            "final_active_cost": float(self.active_cost),
+            "peak_active_cost": float(self.peak_active_cost),
+            "gross_charge": float(self.gross_charge),
+            "total_refund": float(self.total_refund),
+            "ever_over_budget": bool(self.ever_over_budget),
+            "final_over_budget": bool(self.net_cost > self.budget),
+        }
 
     def _rebuild_system_indices_by_type(self) -> None:
         grouped: dict[int, list[int]] = {}
@@ -368,6 +418,8 @@ class MissionEnv(gym.Env):
         cost_delta = float(FULL_SOS[sys_idx].cost)
         self.net_cost += cost_delta
         self.active_cost += cost_delta
+        self.gross_charge += cost_delta
+        self._record_cost_state()
         self.architecture_change_count += 1
         self.steps_since_change = 0
         self.decision_version += 1
@@ -399,6 +451,7 @@ class MissionEnv(gym.Env):
         self.net_cost = max(0.0, self.net_cost - refund)
         self.active_cost = max(0.0, self.active_cost - system_cost)
         self.total_refund += refund
+        self._record_cost_state()
         self.architecture_change_count += 1
         self.steps_since_change = 0
         self.decision_version += 1
@@ -441,27 +494,68 @@ class MissionEnv(gym.Env):
             "refund": float(removed["refund"]),
         }
 
-    def hypothetical_assignment_mask(self, active_mask: np.ndarray) -> np.ndarray:
-        """Compute current-operation feasibility without mutating the environment."""
-        mask = np.zeros((self.T, self.O, self.N), dtype=bool)
+    def current_candidate_finish_times(self) -> np.ndarray:
+        """Finish times for every current-operation/candidate-system pair.
+
+        The matrix is independent of the active mask and therefore shared by
+        every architecture-rule simulation in one decision version.
+        """
+        if (
+            self._candidate_finish_cache_version == self.decision_version
+            and self._candidate_finish_cache is not None
+        ):
+            return self._candidate_finish_cache
+
+        finish_times = np.full((self.T, self.N), np.inf, dtype=np.float32)
         for task_idx in range(self.T):
             op_idx = int(self.state.task_op_idx[task_idx])
             if op_idx >= self.O:
                 continue
             operation = self.mission[task_idx].operations[op_idx]
-            operation_ready = float(
-                self.state.operation_ready_time[task_idx, op_idx]
+            system_indices = np.flatnonzero(
+                SYSTEM_FUNC_TYPES == int(operation.func_type)
             )
-            for sys_idx in np.flatnonzero(active_mask):
-                system = FULL_SOS[int(sys_idx)]
-                if int(system.func_type) != int(operation.func_type):
-                    continue
-                system_ready = float(self.state.system_ready_time[int(sys_idx)])
-                if not np.isfinite(system_ready):
-                    system_ready = float(system.available_from)
-                start = max(system_ready, operation_ready)
-                if start + float(operation.duration) <= float(system.available_until):
-                    mask[task_idx, op_idx, int(sys_idx)] = True
+            if not system_indices.size:
+                continue
+            ready = self.state.system_ready_time[system_indices]
+            ready = np.where(
+                np.isfinite(ready),
+                ready,
+                SYSTEM_AVAILABLE_FROM[system_indices],
+            )
+            starts = np.maximum(
+                ready,
+                float(self.state.operation_ready_time[task_idx, op_idx]),
+            )
+            finishes = starts + float(operation.duration)
+            valid = finishes <= SYSTEM_AVAILABLE_UNTIL[system_indices]
+            finish_times[task_idx, system_indices[valid]] = finishes[valid]
+
+        finish_times.setflags(write=False)
+        self._candidate_finish_cache_version = int(self.decision_version)
+        self._candidate_finish_cache = finish_times
+        return finish_times
+
+    def has_feasible_assignment(self, active_mask: np.ndarray) -> bool:
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.shape != (self.N,):
+            raise ValueError("active_mask has the wrong shape.")
+        return bool(
+            np.any(np.isfinite(self.current_candidate_finish_times()[:, active_mask]))
+        )
+
+    def hypothetical_assignment_mask(self, active_mask: np.ndarray) -> np.ndarray:
+        """Compute current-operation feasibility without mutating the environment."""
+        active_mask = np.asarray(active_mask, dtype=bool)
+        if active_mask.shape != (self.N,):
+            raise ValueError("active_mask has the wrong shape.")
+        mask = np.zeros((self.T, self.O, self.N), dtype=bool)
+        feasible = np.isfinite(self.current_candidate_finish_times())
+        feasible &= active_mask[np.newaxis, :]
+        for task_idx in range(self.T):
+            op_idx = int(self.state.task_op_idx[task_idx])
+            if op_idx < self.O:
+                mask[task_idx, op_idx] = feasible[task_idx]
         return mask
 
     def global_assignment_mask(self) -> np.ndarray:
@@ -521,29 +615,24 @@ class MissionEnv(gym.Env):
         start_times = np.full(assignment_shape, np.inf, dtype=np.float32)
         finish_times = np.full(assignment_shape, np.inf, dtype=np.float32)
 
+        candidate_finishes = self.current_candidate_finish_times()
         for task_idx in range(self.T):
             op_idx = int(self.state.task_op_idx[task_idx])
             if op_idx >= self.O:
                 continue
-
             operation = self.mission[task_idx].operations[op_idx]
-            operation_ready = float(
-                self.state.operation_ready_time[task_idx, op_idx]
+            feasible_systems = np.flatnonzero(
+                self.active_system_mask
+                & np.isfinite(candidate_finishes[task_idx])
             )
-            for sys_idx in self.system_indices_by_type.get(
-                int(operation.func_type),
-                [],
-            ):
-                start_time = max(
-                    float(self.state.system_ready_time[sys_idx]),
-                    operation_ready,
-                )
-                finish_time = start_time + float(operation.duration)
-                if finish_time > float(FULL_SOS[sys_idx].available_until):
-                    continue
-                mask[task_idx, op_idx, sys_idx] = True
-                start_times[task_idx, op_idx, sys_idx] = start_time
-                finish_times[task_idx, op_idx, sys_idx] = finish_time
+            if not feasible_systems.size:
+                continue
+            task_finishes = candidate_finishes[task_idx, feasible_systems]
+            mask[task_idx, op_idx, feasible_systems] = True
+            start_times[task_idx, op_idx, feasible_systems] = (
+                task_finishes - float(operation.duration)
+            )
+            finish_times[task_idx, op_idx, feasible_systems] = task_finishes
 
         self.assignment_mask = mask
         self.assignment_start_time = start_times
@@ -692,7 +781,9 @@ class MissionEnv(gym.Env):
 
         success = bool(np.all(self.state.task_op_idx == self.O))
         if self.adaptive:
-            globally_feasible = bool(np.any(self.global_assignment_mask()))
+            globally_feasible = self.has_feasible_assignment(
+                np.ones(self.N, dtype=np.bool_)
+            )
             dead_end = not success and not globally_feasible
             needs_architecture_change = (
                 not success and not np.any(self.assignment_mask) and globally_feasible

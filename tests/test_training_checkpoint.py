@@ -6,11 +6,11 @@ from unittest.mock import patch
 import numpy as np
 import torch
 
-import dqn
-import evaluate_independent
-import hrule
-import main
-import rule
+from sosrl import cli
+from sosrl.rules import huang as hrule
+from sosrl.rules import scheduling as rule
+from sosrl.workflows import evaluation as evaluate_independent
+from sosrl.workflows import scheduler as dqn
 
 
 class TrainingCheckpointTests(unittest.TestCase):
@@ -113,14 +113,16 @@ class RuleSetCompatibilityTests(unittest.TestCase):
             dqn.evaluate_dqn(agent, scenario_pool=None, episodes=0)
 
     def test_main_accepts_huang_rule_set(self):
-        with patch("sys.argv", ["main.py", "--rule-set", "huang"]):
-            args = main.parse_args()
+        args = cli.build_parser().parse_args(
+            ["train-scheduler", "--rule-set", "huang"]
+        )
 
         self.assertEqual(args.rule_set, "huang")
 
     def test_main_uses_a_separate_evaluation_seed(self):
-        with patch("sys.argv", ["main.py", "--eval-seed", "99"]):
-            args = main.parse_args()
+        args = cli.build_parser().parse_args(
+            ["train-scheduler", "--eval-seed", "99"]
+        )
 
         self.assertEqual(args.eval_seed, 99)
 
@@ -136,10 +138,10 @@ class IndependentEvaluationTests(unittest.TestCase):
         )
 
         with patch.object(
-            evaluate_independent.dqn,
+            evaluate_independent.scheduler,
             "set_seed",
         ) as set_seed, patch.object(
-            evaluate_independent.dqn,
+            evaluate_independent.scheduler,
             "ScenarioPool",
             return_value="pool",
         ) as scenario_pool:

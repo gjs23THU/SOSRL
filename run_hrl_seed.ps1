@@ -37,7 +37,7 @@ Set-Location -LiteralPath $repoRoot
 try {
     Write-RunStatus -Stage "training"
     $trainArgs = @(
-        "-u", ".\hrlmain.py", "train-architecture",
+        "-u", "-m", "sosrl", "train-architecture",
         "--scheduler-checkpoint", $schedulerCheckpoint,
         "--episodes", "1000",
         "--scenario-pool-size", "100",
@@ -65,7 +65,7 @@ try {
 
     Write-RunStatus -Stage "evaluating"
     $evalArgs = @(
-        "-u", ".\hrlmain.py", "evaluate",
+        "-u", "-m", "sosrl", "evaluate",
         "--checkpoint", (Join-Path $trainDir "hrl.pt"),
         "--eval-episodes", "100",
         "--eval-seed", "20260724",

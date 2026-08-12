@@ -3,10 +3,10 @@ from unittest.mock import patch
 
 import numpy as np
 
-import archrule
-import env
-import rule
-import syn
+from sosrl import domain as syn
+from sosrl import environment as env
+from sosrl.rules import architecture as archrule
+from sosrl.rules import scheduling as rule
 
 
 class AdaptiveMissionEnvironmentTests(unittest.TestCase):
@@ -62,6 +62,67 @@ class AdaptiveMissionEnvironmentTests(unittest.TestCase):
             mission_env.net_cost,
             initial_cost + 1.2 * float(added.cost),
         )
+
+    def test_cost_trajectory_records_peak_and_transient_budget_violation(self):
+        mission = [self.make_task(0, [syn.func_type2idx["S"]])]
+        initial = self.system(0)
+        added = self.system(2)
+        budget = float(initial.cost) + 0.5 * float(added.cost)
+        mission_env = env.MissionEnv(
+            [initial],
+            mission,
+            adaptive=True,
+            budget=budget,
+        )
+
+        initial_metrics = mission_env.cost_metrics()
+        self.assertEqual(initial_metrics["initial_net_cost"], float(initial.cost))
+        self.assertEqual(initial_metrics["gross_charge"], float(initial.cost))
+        self.assertFalse(initial_metrics["ever_over_budget"])
+
+        mission_env.add_system(added.index)
+        mission_env.remove_system(added.index)
+        metrics = mission_env.cost_metrics()
+
+        self.assertEqual(
+            metrics["peak_net_cost"],
+            float(initial.cost + added.cost),
+        )
+        self.assertEqual(
+            metrics["gross_charge"],
+            float(initial.cost + added.cost),
+        )
+        self.assertEqual(metrics["total_refund"], 0.8 * float(added.cost))
+        self.assertTrue(metrics["ever_over_budget"])
+        self.assertFalse(metrics["final_over_budget"])
+        self.assertEqual(metrics["final_net_cost"], mission_env.net_cost)
+
+    def test_reset_restores_initial_cost_trajectory(self):
+        mission = [self.make_task(0, [syn.func_type2idx["S"]])]
+        initial = self.system(0)
+        added = self.system(2)
+        mission_env = env.MissionEnv([initial], mission, adaptive=True)
+        mission_env.add_system(added.index)
+
+        mission_env.reset()
+        metrics = mission_env.cost_metrics()
+
+        self.assertEqual(metrics["gross_charge"], float(initial.cost))
+        self.assertEqual(metrics["peak_net_cost"], float(initial.cost))
+        self.assertEqual(metrics["peak_active_cost"], float(initial.cost))
+        self.assertFalse(metrics["ever_over_budget"])
+
+    def test_candidate_finish_matrix_is_cached_by_decision_version(self):
+        mission = [self.make_task(0, [syn.func_type2idx["S"]])]
+        mission_env = env.MissionEnv([self.system(0)], mission, adaptive=True)
+
+        first = mission_env.current_candidate_finish_times()
+        second = mission_env.current_candidate_finish_times()
+        self.assertIs(first, second)
+
+        mission_env.add_system(self.system(2).index)
+        third = mission_env.current_candidate_finish_times()
+        self.assertIsNot(first, third)
 
     def test_remove_preserves_past_assignment_and_blocks_future_use(self):
         s_type = syn.func_type2idx["S"]

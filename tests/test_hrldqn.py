@@ -5,13 +5,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import archrule
-import dqn
-import env
-import hrldqn
-import intdqn
-import rule
-import syn
+from sosrl import domain as syn
+from sosrl import environment as env
+from sosrl.baselines import flat as intdqn
+from sosrl.rules import architecture as archrule
+from sosrl.rules import scheduling as rule
+from sosrl.workflows import hierarchical as hrldqn
+from sosrl.workflows import scheduler as dqn
 
 
 class NStepReplayTests(unittest.TestCase):
@@ -170,6 +170,40 @@ class HRLIntegrationTests(unittest.TestCase):
             hrldqn.scheduler_reward(0.0, success=False, dead_end=True),
             -2.0,
         )
+
+    def test_episode_row_contains_complete_cost_trajectory(self):
+        mission = [self.make_task(syn.func_type2idx["S"])]
+        mission_env = env.MissionEnv(
+            [env.FULL_SOS[0]],
+            mission,
+            adaptive=True,
+            budget=float(env.FULL_SOS[0].cost + env.FULL_SOS[2].cost / 2),
+        )
+        mission_env.add_system(2)
+        mission_env.remove_system(2)
+        result = {
+            "architecture_reward": 0.0,
+            "scheduler_reward": 0.0,
+            "architecture_loss": None,
+            "scheduler_loss": None,
+            "success": False,
+            "dead_end": False,
+            "architecture_rule_counts": np.zeros(6, dtype=np.int32),
+            "scheduler_rule_counts": np.zeros(4, dtype=np.int32),
+        }
+
+        row = hrldqn.episode_row(
+            0,
+            "test",
+            mission_env,
+            result,
+            0.0,
+        )
+
+        self.assertTrue(row["ever_over_budget"])
+        self.assertFalse(row["final_over_budget"])
+        self.assertGreater(row["peak_net_cost"], row["final_net_cost"])
+        self.assertEqual(row["gross_charge"], row["initial_net_cost"] + env.FULL_SOS[2].cost)
 
     def test_combined_checkpoint_restores_both_policy_networks(self):
         mission = [self.make_task(syn.func_type2idx["S"])]

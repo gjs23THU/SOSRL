@@ -1,253 +1,20 @@
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import asdict, dataclass
 import hashlib
 import json
-from pathlib import Path
 import random
-from typing import Any
 
 import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
 
-import archrule
-import dqn
-import env
-import rule
-import syn
-
-
-@dataclass
-class HRLConfig:
-    episodes: int = 500
-    scenario_pool_size: int = 50
-    budget: float = 8000.0
-    refund_rate: float = 0.8
-    gamma: float = 0.99
-    n_step: int = 5
-    architecture_lr: float = 1e-4
-    scheduler_finetune_lr: float = 1e-5
-    batch_size: int = 64
-    buffer_size: int = 20000
-    min_buffer_size: int = 500
-    target_update_interval: int = 100
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
-    hidden_dim: int = 256
-    seed: int = 1
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-class ArchitectureReplayBuffer:
-    def __init__(self, capacity: int):
-        self.buffer = deque(maxlen=int(capacity))
-
-    def add(
-        self,
-        obs,
-        action,
-        reward,
-        next_obs,
-        done,
-        next_mask,
-        discount,
-    ):
-        self.buffer.append(
-            (
-                np.asarray(obs, dtype=np.float32),
-                int(action),
-                float(reward),
-                np.asarray(next_obs, dtype=np.float32),
-                bool(done),
-                np.asarray(next_mask, dtype=np.float32),
-                float(discount),
-            )
-        )
-
-    def sample(self, batch_size: int):
-        batch = random.sample(self.buffer, int(batch_size))
-        obs, action, reward, next_obs, done, next_mask, discount = zip(*batch)
-        return (
-            np.asarray(obs, dtype=np.float32),
-            np.asarray(action, dtype=np.int64),
-            np.asarray(reward, dtype=np.float32),
-            np.asarray(next_obs, dtype=np.float32),
-            np.asarray(done, dtype=np.float32),
-            np.asarray(next_mask, dtype=np.float32),
-            np.asarray(discount, dtype=np.float32),
-        )
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class NStepAccumulator:
-    """Convert primitive architecture transitions into n-step transitions."""
-
-    def __init__(self, n_step: int, gamma: float):
-        if int(n_step) <= 0:
-            raise ValueError("n_step must be positive.")
-        self.n_step = int(n_step)
-        self.gamma = float(gamma)
-        self.pending = deque()
-
-    def append(self, transition):
-        self.pending.append(transition)
-        emitted = []
-        if len(self.pending) >= self.n_step:
-            emitted.append(self._emit_one())
-        if bool(transition[4]):
-            while self.pending:
-                emitted.append(self._emit_one())
-        return emitted
-
-    def _emit_one(self):
-        first = self.pending[0]
-        reward = 0.0
-        steps = 0
-        last = first
-        for transition in list(self.pending)[: self.n_step]:
-            reward += (self.gamma**steps) * float(transition[2])
-            steps += 1
-            last = transition
-            if bool(transition[4]):
-                break
-        self.pending.popleft()
-        return (
-            first[0],
-            first[1],
-            reward,
-            last[3],
-            bool(last[4]),
-            last[5],
-            self.gamma**steps,
-        )
-
-    def clear(self):
-        self.pending.clear()
-
-
-class ArchitectureDQNAgent:
-    """The single-headed upper policy. No trigger or termination network."""
-
-    def __init__(self, obs_dim: int, config: HRLConfig):
-        self.config = config
-        self.obs_dim = int(obs_dim)
-        self.action_dim = archrule.ArchitectureRule.RULE_NUM
-        self.device = torch.device(config.device)
-        self.q_net = dqn.QNetwork(
-            self.obs_dim,
-            self.action_dim,
-            config.hidden_dim,
-        ).to(self.device)
-        self.target_net = dqn.QNetwork(
-            self.obs_dim,
-            self.action_dim,
-            config.hidden_dim,
-        ).to(self.device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = optim.Adam(
-            self.q_net.parameters(),
-            lr=config.architecture_lr,
-        )
-        self.replay = ArchitectureReplayBuffer(config.buffer_size)
-        self.learn_step = 0
-
-    def select_action(self, obs, action_mask, epsilon: float = 0.0) -> int:
-        valid = np.flatnonzero(np.asarray(action_mask) > 0)
-        if not valid.size:
-            raise ValueError("No valid architecture action.")
-        if epsilon > 0 and random.random() < epsilon:
-            return int(random.choice(valid.tolist()))
-        obs_tensor = torch.as_tensor(
-            obs,
-            dtype=torch.float32,
-            device=self.device,
-        ).unsqueeze(0)
-        mask_tensor = torch.as_tensor(
-            action_mask,
-            dtype=torch.float32,
-            device=self.device,
-        ).unsqueeze(0)
-        with torch.no_grad():
-            values = self.q_net(obs_tensor)
-            values = values.masked_fill(mask_tensor <= 0, -1e9)
-        return int(values.argmax(dim=1).item())
-
-    def learn(self):
-        required = max(self.config.batch_size, self.config.min_buffer_size)
-        if len(self.replay) < required:
-            return None
-        obs, action, reward, next_obs, done, next_mask, discount = self.replay.sample(
-            self.config.batch_size
-        )
-        obs = torch.as_tensor(obs, dtype=torch.float32, device=self.device)
-        action = torch.as_tensor(action, dtype=torch.int64, device=self.device).unsqueeze(1)
-        reward = torch.as_tensor(reward, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_obs = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
-        done = torch.as_tensor(done, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_mask = torch.as_tensor(next_mask, dtype=torch.float32, device=self.device)
-        discount = torch.as_tensor(
-            discount,
-            dtype=torch.float32,
-            device=self.device,
-        ).unsqueeze(1)
-
-        value = self.q_net(obs).gather(1, action)
-        with torch.no_grad():
-            next_value = self.target_net(next_obs)
-            next_value = next_value.masked_fill(next_mask <= 0, -1e9)
-            next_value = next_value.max(dim=1, keepdim=True).values
-            has_next = (next_mask.sum(dim=1, keepdim=True) > 0).float()
-            target = reward + discount * (1.0 - done) * has_next * next_value
-        loss = nn.functional.mse_loss(value, target)
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
-        self.optimizer.step()
-
-        self.learn_step += 1
-        if self.learn_step % self.config.target_update_interval == 0:
-            self.target_net.load_state_dict(self.q_net.state_dict())
-        return float(loss.item())
-
-    def save_checkpoint(self, path, training_state=None):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save(
-            {
-                "obs_dim": self.obs_dim,
-                "action_dim": self.action_dim,
-                "config": asdict(self.config),
-                "q_net_state_dict": self.q_net.state_dict(),
-                "target_net_state_dict": self.target_net.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "learn_step": self.learn_step,
-                "training_state": training_state or {},
-            },
-            path,
-        )
-        return path
-
-    @classmethod
-    def load_checkpoint(cls, path, device=None, load_optimizer=True):
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(path, map_location=device, weights_only=True)
-        values = dict(checkpoint["config"])
-        values["device"] = str(device)
-        agent = cls(int(checkpoint["obs_dim"]), HRLConfig(**values))
-        if int(checkpoint["action_dim"]) != agent.action_dim:
-            raise ValueError("architecture checkpoint action dimension must be six.")
-        agent.q_net.load_state_dict(checkpoint["q_net_state_dict"])
-        agent.target_net.load_state_dict(checkpoint["target_net_state_dict"])
-        if load_optimizer:
-            agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        agent.learn_step = int(checkpoint["learn_step"])
-        return agent, checkpoint
+from .. import domain as syn
+from .. import environment as env
+from ..rl.agent import ArchitectureDQNAgent
+from ..rl.checkpoint import load_combined_checkpoint, save_combined_checkpoint
+from ..rl.config import HRLConfig
+from ..rl.replay import ArchitectureReplayBuffer, NStepAccumulator
+from ..rules import architecture as archrule
+from ..rules import scheduling as rule
+from . import scheduler as dqn
 
 
 class AdaptiveScenarioPool:
@@ -623,6 +390,7 @@ def episode_row(episode, category, mission_env, result, epsilon):
         "assigned_ops": int(np.sum(mission_env.state.task_op_idx)),
         "epsilon": float(epsilon),
     }
+    row.update(mission_env.cost_metrics())
     for index, name in enumerate(archrule.ArchitectureRule.RULE_NAMES):
         row[f"arch_{name.lower()}_count"] = int(
             result["architecture_rule_counts"][index]
@@ -777,6 +545,33 @@ def evaluate_static_scheduler(
                     sum(system.cost for system in architecture) > budget
                 ),
                 "assigned_ops": int(np.sum(mission_env.state.task_op_idx)),
+                "initial_net_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "final_net_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "peak_net_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "initial_active_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "final_active_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "peak_active_cost": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "gross_charge": float(
+                    sum(system.cost for system in architecture)
+                ),
+                "ever_over_budget": bool(
+                    sum(system.cost for system in architecture) > budget
+                ),
+                "final_over_budget": bool(
+                    sum(system.cost for system in architecture) > budget
+                ),
             }
         )
     return results
@@ -819,6 +614,15 @@ def evaluate_flat_intdqn(flat_agent, scenarios, *, budget=8000.0):
                 ),
                 "budget_violation": bool(mission_env.state.cur_cost > budget),
                 "assigned_ops": int(np.sum(mission_env.state.task_op_idx)),
+                "initial_net_cost": 0.0,
+                "final_net_cost": float(mission_env.state.cur_cost),
+                "peak_net_cost": float(mission_env.state.cur_cost),
+                "initial_active_cost": 0.0,
+                "final_active_cost": float(mission_env.state.cur_cost),
+                "peak_active_cost": float(mission_env.state.cur_cost),
+                "gross_charge": float(mission_env.state.cur_cost),
+                "ever_over_budget": bool(mission_env.state.cur_cost > budget),
+                "final_over_budget": bool(mission_env.state.cur_cost > budget),
             }
         )
     return results
@@ -845,70 +649,3 @@ def scenario_hash(architecture, mission):
     }
     value = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
-
-
-def save_combined_checkpoint(
-    path,
-    architecture_agent,
-    scheduler_agent,
-    training_state=None,
-):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    checkpoint = {
-        "architecture": {
-            "obs_dim": architecture_agent.obs_dim,
-            "action_dim": architecture_agent.action_dim,
-            "config": asdict(architecture_agent.config),
-            "q_net_state_dict": architecture_agent.q_net.state_dict(),
-            "target_net_state_dict": architecture_agent.target_net.state_dict(),
-            "optimizer_state_dict": architecture_agent.optimizer.state_dict(),
-            "learn_step": architecture_agent.learn_step,
-        },
-        "scheduler": {
-            "obs_dim": scheduler_agent.obs_dim,
-            "action_dim": scheduler_agent.action_dim,
-            "config": asdict(scheduler_agent.config),
-            "q_net_state_dict": scheduler_agent.q_net.state_dict(),
-            "target_net_state_dict": scheduler_agent.target_net.state_dict(),
-            "optimizer_state_dict": scheduler_agent.optimizer.state_dict(),
-            "learn_step": scheduler_agent.learn_step,
-        },
-        "training_state": training_state or {},
-    }
-    torch.save(checkpoint, path)
-    return path
-
-
-def load_combined_checkpoint(path, device=None, load_optimizer=True):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(path, map_location=device, weights_only=True)
-    arch_data = checkpoint["architecture"]
-    arch_values = dict(arch_data["config"])
-    arch_values["device"] = str(device)
-    architecture_agent = ArchitectureDQNAgent(
-        int(arch_data["obs_dim"]),
-        HRLConfig(**arch_values),
-    )
-    if int(arch_data["action_dim"]) != architecture_agent.action_dim:
-        raise ValueError("combined checkpoint architecture action dimension must be six.")
-    architecture_agent.q_net.load_state_dict(arch_data["q_net_state_dict"])
-    architecture_agent.target_net.load_state_dict(arch_data["target_net_state_dict"])
-    architecture_agent.learn_step = int(arch_data["learn_step"])
-    if load_optimizer:
-        architecture_agent.optimizer.load_state_dict(arch_data["optimizer_state_dict"])
-
-    scheduler_data = checkpoint["scheduler"]
-    scheduler_values = dict(scheduler_data["config"])
-    scheduler_values["device"] = str(device)
-    scheduler_agent = dqn.DQNAgent(
-        int(scheduler_data["obs_dim"]),
-        int(scheduler_data["action_dim"]),
-        dqn.DQNConfig(**scheduler_values),
-    )
-    scheduler_agent.q_net.load_state_dict(scheduler_data["q_net_state_dict"])
-    scheduler_agent.target_net.load_state_dict(scheduler_data["target_net_state_dict"])
-    scheduler_agent.learn_step = int(scheduler_data["learn_step"])
-    if load_optimizer:
-        scheduler_agent.optimizer.load_state_dict(scheduler_data["optimizer_state_dict"])
-    return architecture_agent, scheduler_agent, checkpoint

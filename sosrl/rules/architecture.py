@@ -5,8 +5,8 @@ from typing import Any
 
 import numpy as np
 
-import env
-import syn
+from .. import domain as syn
+from .. import environment as env
 
 
 @dataclass(frozen=True)
@@ -40,14 +40,25 @@ class ArchitectureRule:
             int,
             ArchitectureResolution | None,
         ] = {}
+        self._action_mask_cache_version: int | None = None
+        self._action_mask_cache: np.ndarray | None = None
         self.cache_hits = 0
         self.cache_misses = 0
 
     def action_mask(self) -> np.ndarray:
-        return np.asarray(
+        version = int(self.mission_env.decision_version)
+        if (
+            self._action_mask_cache_version == version
+            and self._action_mask_cache is not None
+        ):
+            return self._action_mask_cache.copy()
+        mask = np.asarray(
             [self.resolve(action) is not None for action in range(self.RULE_NUM)],
             dtype=np.float32,
         )
+        self._action_mask_cache_version = version
+        self._action_mask_cache = mask
+        return mask.copy()
 
     def resolve(self, action: int) -> ArchitectureResolution | None:
         action = int(action)
@@ -139,24 +150,17 @@ class ArchitectureRule:
         sys_idx: int,
     ) -> float | None:
         mission_env = self.mission_env
-        system = env.FULL_SOS[sys_idx]
-        operation = mission_env.mission[task_idx].operations[op_idx]
-        if int(system.func_type) != int(operation.func_type):
+        if int(mission_env.state.task_op_idx[task_idx]) != int(op_idx):
             return None
-        ready = float(mission_env.state.system_ready_time[sys_idx])
-        if not np.isfinite(ready):
-            ready = float(system.available_from)
-        start = max(
-            ready,
-            float(mission_env.state.operation_ready_time[task_idx, op_idx]),
+        finish = float(
+            mission_env.current_candidate_finish_times()[task_idx, sys_idx]
         )
-        finish = start + float(operation.duration)
-        if finish > float(system.available_until):
+        if not np.isfinite(finish):
             return None
         return finish
 
     def _would_enable_assignment(self, active_mask: np.ndarray) -> bool:
-        return bool(np.any(self.mission_env.hypothetical_assignment_mask(active_mask)))
+        return self.mission_env.has_feasible_assignment(active_mask)
 
     def _add_capability(self) -> ArchitectureResolution | None:
         mission_env = self.mission_env
@@ -310,18 +314,16 @@ class ArchitectureRule:
 
     def _best_ready_finish(self, active_mask: np.ndarray) -> float:
         mission_env = self.mission_env
-        assignment_mask = mission_env.hypothetical_assignment_mask(active_mask)
+        finish_matrix = mission_env.current_candidate_finish_times()
+        active_mask = np.asarray(active_mask, dtype=bool)
         finishes = []
         for task_idx, op_idx, _ in self._ready_operations():
-            systems = np.flatnonzero(assignment_mask[task_idx, op_idx])
+            systems = np.flatnonzero(
+                active_mask & np.isfinite(finish_matrix[task_idx])
+            )
             if not systems.size:
                 continue
-            finishes.append(
-                min(
-                    self._candidate_finish(task_idx, op_idx, int(sys_idx))
-                    for sys_idx in systems
-                )
-            )
+            finishes.append(float(np.min(finish_matrix[task_idx, systems])))
         return float(np.mean(finishes)) if finishes else float("inf")
 
     def _replace_inefficient(self) -> ArchitectureResolution | None:

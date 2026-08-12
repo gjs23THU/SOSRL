@@ -3,10 +3,10 @@ from unittest.mock import patch
 
 import numpy as np
 
-import dqn
-import env
-import rule
-import syn
+from sosrl import domain as syn
+from sosrl import environment as env
+from sosrl.rules import scheduling as rule
+from sosrl.workflows import scheduler as dqn
 
 
 class SARuleEnvironmentTests(unittest.TestCase):

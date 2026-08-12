@@ -1,43 +1,16 @@
-from collections import deque
-from dataclasses import asdict, dataclass
-from pathlib import Path
 import random
 
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from tqdm.auto import tqdm
 
-import env
-import hrule
-import rule
-import syn
-
-
-@dataclass
-class DQNConfig:
-    episodes: int = 200
-    scenario_pool_size: int = 20
-    scenario_order: str = "random"
-    shared_mission: bool = False
-    rule_set: str = "standard"
-    selected_system_num: int | tuple[int, int] | None = None
-    min_system_num: int = 3
-    max_system_num: int = 22
-    cost_limit: float | None = 8000
-    gamma: float = 0.99
-    lr: float = 1e-4
-    batch_size: int = 64
-    buffer_size: int = 10000
-    min_buffer_size: int = 500
-    target_update_interval: int = 100
-    epsilon_start: float = 1.0
-    epsilon_end: float = 0.05
-    epsilon_decay: float = 0.995
-    hidden_dim: int = 1024
-    seed: int = 1
-    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+from .. import domain as syn
+from .. import environment as env
+from ..rl.agent import DQNAgent, QNetwork
+from ..rl.config import DQNConfig
+from ..rl.replay import ReplayBuffer
+from ..rules import huang as hrule
+from ..rules import scheduling as rule
 
 
 def get_rule_class(rule_set):
@@ -46,141 +19,6 @@ def get_rule_class(rule_set):
     if rule_set == "huang":
         return hrule.HRule
     raise ValueError(f"Unknown rule set: {rule_set}")
-
-
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
-
-    def add(self, obs, action, reward, next_obs, done, next_mask):
-        self.buffer.append((obs, action, reward, next_obs, done, next_mask))
-
-    def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        obs, action, reward, next_obs, done, next_mask = zip(*batch)
-        return (
-            np.asarray(obs, dtype=np.float32),
-            np.asarray(action, dtype=np.int64),
-            np.asarray(reward, dtype=np.float32),
-            np.asarray(next_obs, dtype=np.float32),
-            np.asarray(done, dtype=np.float32),
-            np.asarray(next_mask, dtype=np.float32),
-        )
-
-    def __len__(self):
-        return len(self.buffer)
-
-
-class QNetwork(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim),
-        )
-
-    def forward(self, obs):
-        return self.net(obs)
-
-
-class DQNAgent:
-    def __init__(self, obs_dim, action_dim, config):
-        self.config = config
-        self.obs_dim = int(obs_dim)
-        self.action_dim = int(action_dim)
-        self.device = torch.device(config.device)
-        self.q_net = QNetwork(obs_dim, action_dim, config.hidden_dim).to(self.device)
-        self.target_net = QNetwork(obs_dim, action_dim, config.hidden_dim).to(self.device)
-        self.target_net.load_state_dict(self.q_net.state_dict())
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=config.lr)
-        self.replay = ReplayBuffer(config.buffer_size)
-        self.learn_step = 0
-
-    def save_checkpoint(self, path, training_state=None):
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        checkpoint = {
-            "obs_dim": self.obs_dim,
-            "action_dim": self.action_dim,
-            "config": asdict(self.config),
-            "q_net_state_dict": self.q_net.state_dict(),
-            "target_net_state_dict": self.target_net.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "learn_step": self.learn_step,
-            "training_state": training_state or {},
-        }
-        torch.save(checkpoint, path)
-        return path
-
-    @classmethod
-    def load_checkpoint(cls, path, device=None, load_optimizer=True):
-        device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        checkpoint = torch.load(path, map_location=device, weights_only=True)
-
-        config_values = dict(checkpoint["config"])
-        config_values["device"] = str(device)
-        agent = cls(
-            obs_dim=int(checkpoint["obs_dim"]),
-            action_dim=int(checkpoint["action_dim"]),
-            config=DQNConfig(**config_values),
-        )
-        agent.q_net.load_state_dict(checkpoint["q_net_state_dict"])
-        agent.target_net.load_state_dict(checkpoint["target_net_state_dict"])
-        if load_optimizer:
-            agent.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        agent.learn_step = int(checkpoint["learn_step"])
-        return agent, checkpoint
-
-    def select_action(self, obs, action_mask, epsilon):
-        valid_actions = np.flatnonzero(action_mask > 0)
-        if len(valid_actions) == 0:
-            raise ValueError("No valid rule action.")
-
-        if epsilon > 0.0 and random.random() < epsilon:
-            return int(random.choice(valid_actions))
-
-        obs_tensor = torch.tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-        mask_tensor = torch.tensor(action_mask, dtype=torch.float32, device=self.device).unsqueeze(0)
-        with torch.no_grad():
-            q_values = self.q_net(obs_tensor)
-            q_values = q_values.masked_fill(mask_tensor <= 0, -1e9)
-        return int(q_values.argmax(dim=1).item())
-
-    def learn(self):
-        if len(self.replay) < max(self.config.min_buffer_size, self.config.batch_size):
-            return None
-
-        obs, action, reward, next_obs, done, next_mask = self.replay.sample(self.config.batch_size)
-        obs = torch.tensor(obs, dtype=torch.float32, device=self.device)
-        action = torch.tensor(action, dtype=torch.int64, device=self.device).unsqueeze(1)
-        reward = torch.tensor(reward, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_obs = torch.tensor(next_obs, dtype=torch.float32, device=self.device)
-        done = torch.tensor(done, dtype=torch.float32, device=self.device).unsqueeze(1)
-        next_mask = torch.tensor(next_mask, dtype=torch.float32, device=self.device)
-
-        q_value = self.q_net(obs).gather(1, action)
-        with torch.no_grad():
-            next_q = self.target_net(next_obs)
-            next_q = next_q.masked_fill(next_mask <= 0, -1e9)
-            next_q = next_q.max(dim=1, keepdim=True).values
-            has_next_action = (next_mask.sum(dim=1, keepdim=True) > 0).float()
-            target = reward + self.config.gamma * (1.0 - done) * has_next_action * next_q
-
-        loss = nn.functional.mse_loss(q_value, target.detach())
-
-        self.optimizer.zero_grad()
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
-        self.optimizer.step()
-
-        self.learn_step += 1
-        if self.learn_step % self.config.target_update_interval == 0:
-            self.target_net.load_state_dict(self.q_net.state_dict())
-
-        return float(loss.item())
 
 
 class ScenarioPool:
