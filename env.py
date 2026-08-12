@@ -9,6 +9,7 @@ import syn
 FULL_SOS = syn.FULL_SOS
 N = len(FULL_SOS)
 OBSERVATION_SIZE = 25
+ARCHITECTURE_ACTION_SIZE = 6
 
 
 class State:
@@ -126,12 +127,16 @@ class State:
 
 
 class MissionEnv(gym.Env):
-    """Offline tail-append scheduling environment for a fixed architecture."""
+    """Offline tail-append scheduler with an optional mutable architecture."""
 
     def __init__(
         self,
         architecture: tuple[syn.ComponentSystem, ...] | list[syn.ComponentSystem],
         mission: list[syn.Task],
+        *,
+        adaptive: bool = False,
+        budget: float = 8000.0,
+        refund_rate: float = 0.8,
     ):
         super().__init__()
         if not mission:
@@ -151,12 +156,27 @@ class MissionEnv(gym.Env):
         self.T = len(mission)
         self.O = len(mission[0].operations)
         self.N = N
+        self.adaptive = bool(adaptive)
+        self.budget = max(float(budget), 1.0)
+        if not 0.0 <= float(refund_rate) <= 1.0:
+            raise ValueError("refund_rate must be between zero and one.")
+        self.refund_rate = float(refund_rate)
 
         selected_system_mask = np.zeros(self.N, dtype=np.bool_)
         selected_system_mask[architecture_indices] = True
-        self.selected_system_mask = selected_system_mask
+        self.initial_system_mask = selected_system_mask.copy()
+        self.active_system_mask = selected_system_mask.copy()
+        # Backwards-compatible name used by State, Rule, and existing tests.
+        self.selected_system_mask = self.active_system_mask
 
         self.state = State(self.selected_system_mask, self.mission)
+        self.used_system_mask = np.zeros(self.N, dtype=np.bool_)
+        self.net_cost = self._mask_cost(self.active_system_mask)
+        self.active_cost = self.net_cost
+        self.total_refund = 0.0
+        self.architecture_change_count = 0
+        self.steps_since_change = 0
+        self.decision_version = 0
         assignment_shape = (self.T, self.O, self.N)
         self.assignment_mask = np.zeros(assignment_shape, dtype=bool)
         self.assignment_start_time = np.full(
@@ -170,9 +190,7 @@ class MissionEnv(gym.Env):
             dtype=np.float32,
         )
         self.system_indices_by_type: dict[int, list[int]] = {}
-        for sys_idx in architecture_indices:
-            func_type = int(FULL_SOS[sys_idx].func_type)
-            self.system_indices_by_type.setdefault(func_type, []).append(sys_idx)
+        self._rebuild_system_indices_by_type()
 
         self.action_space = gym.spaces.Discrete(self.T * self.O * self.N)
         self.observation_space = gym.spaces.Box(
@@ -181,7 +199,17 @@ class MissionEnv(gym.Env):
             shape=(OBSERVATION_SIZE,),
             dtype=np.float32,
         )
+        self.architecture_action_space = gym.spaces.Discrete(
+            ARCHITECTURE_ACTION_SIZE
+        )
         self.refresh_derived_state()
+        architecture_obs = self.architecture_observation()
+        self.architecture_observation_space = gym.spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=architecture_obs.shape,
+            dtype=np.float32,
+        )
 
     def reset(
         self,
@@ -189,9 +217,257 @@ class MissionEnv(gym.Env):
         options: dict[str, Any] | None = None,
     ):
         super().reset(seed=seed)
+        self.active_system_mask = self.initial_system_mask.copy()
+        self.selected_system_mask = self.active_system_mask
         self.state = State(self.selected_system_mask, self.mission)
+        self.used_system_mask = np.zeros(self.N, dtype=np.bool_)
+        self.net_cost = self._mask_cost(self.active_system_mask)
+        self.active_cost = self.net_cost
+        self.total_refund = 0.0
+        self.architecture_change_count = 0
+        self.steps_since_change = 0
+        self.decision_version += 1
+        self._rebuild_system_indices_by_type()
         self.refresh_derived_state()
-        return self.state.to_obs(), {}
+        return self.schedule_observation(), {}
+
+    @staticmethod
+    def _mask_cost(mask: np.ndarray) -> float:
+        return float(
+            sum(FULL_SOS[index].cost for index in np.flatnonzero(mask))
+        )
+
+    def _rebuild_system_indices_by_type(self) -> None:
+        grouped: dict[int, list[int]] = {}
+        for sys_idx in np.flatnonzero(self.active_system_mask):
+            func_type = int(FULL_SOS[int(sys_idx)].func_type)
+            grouped.setdefault(func_type, []).append(int(sys_idx))
+        self.system_indices_by_type = grouped
+
+    def schedule_observation(self) -> np.ndarray:
+        """Observation consumed by the four-rule scheduling policy."""
+        return self.state.to_obs()
+
+    def remaining_demand_by_type(self) -> np.ndarray:
+        function_count = len(syn.func_type2idx)
+        demand = np.zeros(function_count, dtype=np.float32)
+        for task_idx, task in enumerate(self.mission):
+            start = int(self.state.task_op_idx[task_idx])
+            for operation in task.operations[start:]:
+                demand[int(operation.func_type)] += float(operation.duration)
+        return demand
+
+    def architecture_observation(self) -> np.ndarray:
+        """Fixed-width state consumed by the architecture policy."""
+        state = self.state
+        scale = state.M
+        ready_time = np.asarray(
+            [
+                (
+                    state.system_ready_time[index]
+                    if np.isfinite(state.system_ready_time[index])
+                    else FULL_SOS[index].available_from
+                )
+                for index in range(self.N)
+            ],
+            dtype=np.float32,
+        ) / scale
+
+        remaining_demand = self.remaining_demand_by_type()
+        type_features = []
+        for func_type in sorted(syn.func_type2idx.values()):
+            active_indices = [
+                index
+                for index in np.flatnonzero(self.active_system_mask)
+                if int(FULL_SOS[int(index)].func_type) == int(func_type)
+            ]
+            inactive_indices = [
+                index
+                for index in range(self.N)
+                if not self.active_system_mask[index]
+                and int(FULL_SOS[index].func_type) == int(func_type)
+            ]
+            capacity = sum(
+                max(
+                    float(FULL_SOS[index].available_until)
+                    - max(
+                        float(FULL_SOS[index].available_from),
+                        float(state.system_ready_time[index]),
+                    ),
+                    0.0,
+                )
+                for index in active_indices
+            )
+            ready_ops = []
+            blocked_ops = 0
+            for task_idx, task in enumerate(self.mission):
+                op_idx = int(state.task_op_idx[task_idx])
+                if op_idx >= self.O:
+                    continue
+                operation = task.operations[op_idx]
+                if int(operation.func_type) != int(func_type):
+                    continue
+                ready_ops.append((task_idx, op_idx))
+                if not np.any(self.assignment_mask[task_idx, op_idx]):
+                    blocked_ops += 1
+            total_busy = sum(float(state.system_busy_time[i]) for i in active_indices)
+            total_known = total_busy + sum(
+                float(state.system_idle_time[i]) for i in active_indices
+            )
+            type_features.extend(
+                [
+                    float(remaining_demand[int(func_type)]) / scale,
+                    float(capacity) / scale,
+                    len(inactive_indices) / max(self.N, 1),
+                    blocked_ops / max(len(ready_ops), 1),
+                    total_busy / max(total_known, 1.0),
+                ]
+            )
+
+        total_operations = max(self.T * self.O, 1)
+        completed = int(np.sum(state.task_op_idx))
+        budget_excess = max(self.net_cost - self.budget, 0.0)
+        scalars = np.asarray(
+            [
+                completed / total_operations,
+                float(state.current_makespan) / scale,
+                self.active_cost / self.budget,
+                self.net_cost / self.budget,
+                budget_excess / self.budget,
+                self.steps_since_change / total_operations,
+            ],
+            dtype=np.float32,
+        )
+        obs = np.concatenate(
+            [
+                self.schedule_observation(),
+                self.active_system_mask.astype(np.float32),
+                self.used_system_mask.astype(np.float32),
+                ready_time,
+                np.asarray(type_features, dtype=np.float32),
+                scalars,
+            ]
+        ).astype(np.float32)
+        return np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _require_adaptive(self) -> None:
+        if not self.adaptive:
+            raise RuntimeError("architecture changes require adaptive=True.")
+
+    def add_system(self, sys_idx: int, *, refresh: bool = True) -> dict[str, Any]:
+        self._require_adaptive()
+        sys_idx = int(sys_idx)
+        if not 0 <= sys_idx < self.N or self.active_system_mask[sys_idx]:
+            return {"valid": False, "cost_delta": 0.0}
+        self.active_system_mask[sys_idx] = True
+        self.state.selected_system_mask[sys_idx] = True
+        if not np.isfinite(self.state.system_ready_time[sys_idx]):
+            self.state.system_ready_time[sys_idx] = float(
+                FULL_SOS[sys_idx].available_from
+            )
+        cost_delta = float(FULL_SOS[sys_idx].cost)
+        self.net_cost += cost_delta
+        self.active_cost += cost_delta
+        self.architecture_change_count += 1
+        self.steps_since_change = 0
+        self.decision_version += 1
+        self._rebuild_system_indices_by_type()
+        if refresh:
+            self.refresh_derived_state()
+        return {
+            "valid": True,
+            "kind": "add",
+            "added_system": sys_idx,
+            "cost_delta": cost_delta,
+            "refund": 0.0,
+        }
+
+    def remove_system(
+        self,
+        sys_idx: int,
+        *,
+        refresh: bool = True,
+    ) -> dict[str, Any]:
+        self._require_adaptive()
+        sys_idx = int(sys_idx)
+        if not 0 <= sys_idx < self.N or not self.active_system_mask[sys_idx]:
+            return {"valid": False, "cost_delta": 0.0}
+        self.active_system_mask[sys_idx] = False
+        self.state.selected_system_mask[sys_idx] = False
+        system_cost = float(FULL_SOS[sys_idx].cost)
+        refund = self.refund_rate * system_cost
+        self.net_cost = max(0.0, self.net_cost - refund)
+        self.active_cost = max(0.0, self.active_cost - system_cost)
+        self.total_refund += refund
+        self.architecture_change_count += 1
+        self.steps_since_change = 0
+        self.decision_version += 1
+        self._rebuild_system_indices_by_type()
+        if refresh:
+            self.refresh_derived_state()
+        return {
+            "valid": True,
+            "kind": "remove",
+            "removed_system": sys_idx,
+            "cost_delta": -refund,
+            "refund": refund,
+        }
+
+    def replace_system(self, old_idx: int, new_idx: int) -> dict[str, Any]:
+        self._require_adaptive()
+        old_idx = int(old_idx)
+        new_idx = int(new_idx)
+        if (
+            not 0 <= old_idx < self.N
+            or not 0 <= new_idx < self.N
+            or not self.active_system_mask[old_idx]
+            or self.active_system_mask[new_idx]
+            or int(FULL_SOS[old_idx].func_type)
+            != int(FULL_SOS[new_idx].func_type)
+        ):
+            return {"valid": False, "cost_delta": 0.0}
+        removed = self.remove_system(old_idx, refresh=False)
+        added = self.add_system(new_idx, refresh=False)
+        # REMOVE+ADD is one atomic architecture decision for reporting.
+        self.architecture_change_count -= 1
+        self._rebuild_system_indices_by_type()
+        self.refresh_derived_state()
+        return {
+            "valid": True,
+            "kind": "replace",
+            "removed_system": old_idx,
+            "added_system": new_idx,
+            "cost_delta": float(removed["cost_delta"] + added["cost_delta"]),
+            "refund": float(removed["refund"]),
+        }
+
+    def hypothetical_assignment_mask(self, active_mask: np.ndarray) -> np.ndarray:
+        """Compute current-operation feasibility without mutating the environment."""
+        mask = np.zeros((self.T, self.O, self.N), dtype=bool)
+        for task_idx in range(self.T):
+            op_idx = int(self.state.task_op_idx[task_idx])
+            if op_idx >= self.O:
+                continue
+            operation = self.mission[task_idx].operations[op_idx]
+            operation_ready = float(
+                self.state.operation_ready_time[task_idx, op_idx]
+            )
+            for sys_idx in np.flatnonzero(active_mask):
+                system = FULL_SOS[int(sys_idx)]
+                if int(system.func_type) != int(operation.func_type):
+                    continue
+                system_ready = float(self.state.system_ready_time[int(sys_idx)])
+                if not np.isfinite(system_ready):
+                    system_ready = float(system.available_from)
+                start = max(system_ready, operation_ready)
+                if start + float(operation.duration) <= float(system.available_until):
+                    mask[task_idx, op_idx, int(sys_idx)] = True
+        return mask
+
+    def global_assignment_mask(self) -> np.ndarray:
+        return self.hypothetical_assignment_mask(
+            np.ones(self.N, dtype=np.bool_)
+        )
 
     def encode_assignment(self, task_idx: int, op_idx: int, sys_idx: int) -> int:
         task_idx = int(task_idx)
@@ -371,6 +647,7 @@ class MissionEnv(gym.Env):
         previous_system_ready = float(state.system_ready_time[sys_idx])
 
         state.op_assign_sys[task_idx, op_idx] = sys_idx
+        self.used_system_mask[sys_idx] = True
         state.op_start_time[task_idx, op_idx] = start_time
         state.op_finish_time[task_idx, op_idx] = finish_time
         state.system_idle_time[sys_idx] += max(
@@ -382,6 +659,7 @@ class MissionEnv(gym.Env):
         state.current_makespan = max(float(state.current_makespan), finish_time)
 
         state.task_op_idx[task_idx] += 1
+        self.decision_version += 1
         if int(state.task_op_idx[task_idx]) == self.O:
             return
 
@@ -409,9 +687,23 @@ class MissionEnv(gym.Env):
         old_makespan = float(self.state.current_makespan)
         self.allocate_assignment(**assignment)
         self.refresh_derived_state()
+        self.steps_since_change += 1
         reward = -(float(self.state.current_makespan) - old_makespan) / self.state.M
 
         success = bool(np.all(self.state.task_op_idx == self.O))
-        dead_end = not success and not np.any(self.assignment_mask)
-        info = {"valid": True, "success": success, "dead_end": dead_end}
-        return self.state.to_obs(), float(reward), success or dead_end, False, info
+        if self.adaptive:
+            globally_feasible = bool(np.any(self.global_assignment_mask()))
+            dead_end = not success and not globally_feasible
+            needs_architecture_change = (
+                not success and not np.any(self.assignment_mask) and globally_feasible
+            )
+        else:
+            dead_end = not success and not np.any(self.assignment_mask)
+            needs_architecture_change = False
+        info = {
+            "valid": True,
+            "success": success,
+            "dead_end": dead_end,
+            "needs_architecture_change": needs_architecture_change,
+        }
+        return self.schedule_observation(), float(reward), success or dead_end, False, info
