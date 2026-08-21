@@ -379,6 +379,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=Path("runs") / "gp_architecture" / "evaluation",
     )
     evaluate_gp.set_defaults(handler=handle_evaluate_gp_stack)
+
+    finetune_branching_gp = subparsers.add_parser(
+        "finetune-branching-with-gp"
+    )
+    finetune_branching_gp.add_argument(
+        "--scheduler-checkpoint", type=Path, required=True
+    )
+    finetune_branching_gp.add_argument("--gp-policy", type=Path, required=True)
+    finetune_branching_gp.add_argument("--scenario-dir", type=Path, required=True)
+    finetune_branching_gp.add_argument("--output-dir", type=Path, required=True)
+    finetune_branching_gp.add_argument("--extra-env-steps", type=int, default=40000)
+    finetune_branching_gp.add_argument(
+        "--checkpoint-interval-steps", type=int, default=10000
+    )
+    finetune_branching_gp.add_argument("--lr", type=float, default=1e-5)
+    finetune_branching_gp.add_argument("--epsilon-start", type=float, default=0.10)
+    finetune_branching_gp.add_argument("--epsilon-end", type=float, default=0.02)
+    finetune_branching_gp.add_argument(
+        "--epsilon-decay", type=float, default=0.995
+    )
+    finetune_branching_gp.add_argument("--seed", type=int, default=4)
+    finetune_branching_gp.add_argument("--device", default="auto")
+    finetune_branching_gp.add_argument("--resume", action="store_true")
+    finetune_branching_gp.add_argument(
+        "--skip-historical-test", action="store_true"
+    )
+    finetune_branching_gp.set_defaults(
+        handler=handle_finetune_branching_with_gp
+    )
     return parser
 
 
@@ -1091,6 +1120,30 @@ def handle_evaluate_gp_stack(args) -> None:
         manual_architecture_checkpoint=args.manual_architecture_checkpoint,
         device=resolve_device(args.device),
         collect_schedule=args.collect_schedule,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_finetune_branching_with_gp(args) -> None:
+    from .workflows.branching_gp_finetune import (
+        finetune_branching_with_frozen_gp,
+    )
+
+    outputs = finetune_branching_with_frozen_gp(
+        scheduler_checkpoint=args.scheduler_checkpoint,
+        gp_policy=args.gp_policy,
+        scenario_dir=args.scenario_dir,
+        output_dir=args.output_dir,
+        extra_env_steps=args.extra_env_steps,
+        checkpoint_interval_steps=args.checkpoint_interval_steps,
+        lr=args.lr,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
+        epsilon_decay=args.epsilon_decay,
+        seed=args.seed,
+        device=args.device,
+        resume=args.resume,
+        skip_historical_test=args.skip_historical_test,
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 

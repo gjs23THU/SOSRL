@@ -31,6 +31,7 @@ class UnifiedCliTests(unittest.TestCase):
                 "generate-gp-scenarios",
                 "train-gp-architecture",
                 "evaluate-gp-stack",
+                "finetune-branching-with-gp",
             },
         )
 
@@ -111,6 +112,26 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(train.generations, 2)
         self.assertEqual(train.feature_set, "system_delta")
         self.assertEqual(evaluate.baselines, ["fixed", "gp"])
+
+        finetune = parser.parse_args(
+            [
+                "finetune-branching-with-gp",
+                "--scheduler-checkpoint",
+                "branching_scheduler.pt",
+                "--gp-policy",
+                "gp_policy.json",
+                "--scenario-dir",
+                "gp_scenarios",
+                "--output-dir",
+                "g0_b1",
+                "--resume",
+                "--skip-historical-test",
+            ]
+        )
+        self.assertEqual(finetune.extra_env_steps, 40000)
+        self.assertEqual(finetune.checkpoint_interval_steps, 10000)
+        self.assertTrue(finetune.resume)
+        self.assertTrue(finetune.skip_historical_test)
 
     def test_flat_rule_commands_parse_training_budget_and_models(self):
         parser, _ = self.subcommands()
