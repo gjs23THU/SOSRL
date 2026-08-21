@@ -4,6 +4,8 @@ import hashlib
 import json
 from statistics import mean, median
 
+from .. import domain as syn
+from .. import environment as env
 from ..rl.agent import DQNAgent
 from . import hierarchical, scheduler
 
@@ -79,7 +81,16 @@ def mission_payload(mission):
     ]
 
 
-def scenario_payload(scenario_idx, architecture, mission):
+def scenario_payload(
+    scenario_idx,
+    architecture,
+    mission,
+    *,
+    category=None,
+    budget=None,
+    refund_rate=None,
+    split=None,
+):
     payload = {
         "scenario_idx": int(scenario_idx),
         "architecture_system_indices": sorted(
@@ -88,6 +99,13 @@ def scenario_payload(scenario_idx, architecture, mission):
         "architecture_cost": float(sum(system.cost for system in architecture)),
         "mission": mission_payload(mission),
     }
+    optional = {
+        "category": category,
+        "budget": None if budget is None else float(budget),
+        "refund_rate": None if refund_rate is None else float(refund_rate),
+        "split": split,
+    }
+    payload.update({key: value for key, value in optional.items() if value is not None})
     canonical = json.dumps(
         payload,
         ensure_ascii=False,
@@ -98,6 +116,56 @@ def scenario_payload(scenario_idx, architecture, mission):
         canonical.encode("utf-8")
     ).hexdigest()
     return payload
+
+
+def mission_from_payload(payload):
+    """Reconstruct a complete mission from its JSON-safe representation."""
+    mission = []
+    for task_item in payload:
+        task_idx = int(task_item["task_idx"])
+        operations = [
+            syn.Operation(
+                index=int(operation["op_idx"]),
+                name=f"Op_{task_idx}_{int(operation['op_idx'])}",
+                func_type=int(operation["func_type"]),
+                duration=int(operation["duration"]),
+                release_time=int(operation["release_time"]),
+            )
+            for operation in task_item["operations"]
+        ]
+        mission.append(
+            syn.Task(
+                index=task_idx,
+                name=f"Task_{task_idx}",
+                operations=operations,
+                release_time=int(task_item["release_time"]),
+                due_time=int(task_item["due_time"]),
+            )
+        )
+    return mission
+
+
+def scenario_from_payload(payload):
+    architecture = tuple(
+        env.FULL_SOS[int(index)]
+        for index in payload["architecture_system_indices"]
+    )
+    return architecture, mission_from_payload(payload["mission"])
+
+
+def verify_scenario_payload(payload):
+    candidate = dict(payload)
+    expected = candidate.pop("scenario_hash", None)
+    canonical = json.dumps(
+        candidate,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    actual = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    if expected != actual:
+        raise ValueError("scenario payload hash mismatch.")
+    return actual
 
 
 def build_independent_pool(config, episodes, eval_seed):
@@ -190,6 +258,81 @@ def paired_rows(rows_by_model):
     return rows
 
 
+def paired_adaptive_comparisons(
+    rows,
+    *,
+    reference_label="hrl",
+    candidate_labels=None,
+):
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["model"], []).append(row)
+    if reference_label not in grouped:
+        raise ValueError(f"reference model is missing: {reference_label}")
+    labels = (
+        list(candidate_labels)
+        if candidate_labels is not None
+        else [label for label in grouped if label != reference_label]
+    )
+    reference_rows = grouped[reference_label]
+    comparisons = []
+    for label in labels:
+        if label not in grouped:
+            raise ValueError(f"candidate model is missing: {label}")
+        candidate_rows = grouped[label]
+        if len(reference_rows) != len(candidate_rows):
+            raise ValueError("paired adaptive models have different scenario counts.")
+
+        makespan_differences = []
+        cost_differences = []
+        reference_only_success = 0
+        candidate_only_success = 0
+        for reference, candidate in zip(
+            reference_rows,
+            candidate_rows,
+            strict=True,
+        ):
+            if reference["scenario_hash"] != candidate["scenario_hash"]:
+                raise ValueError("Models were not evaluated on matching scenarios.")
+            cost_differences.append(candidate["net_cost"] - reference["net_cost"])
+            if reference["success"] and candidate["success"]:
+                makespan_differences.append(
+                    candidate["makespan"] - reference["makespan"]
+                )
+            elif reference["success"]:
+                reference_only_success += 1
+            elif candidate["success"]:
+                candidate_only_success += 1
+
+        comparisons.append(
+            {
+                "reference_model": reference_label,
+                "candidate_model": label,
+                "paired_scenarios": len(reference_rows),
+                "common_success_count": len(makespan_differences),
+                "reference_only_success_count": reference_only_success,
+                "candidate_only_success_count": candidate_only_success,
+                "mean_candidate_minus_reference_makespan": (
+                    mean(makespan_differences) if makespan_differences else None
+                ),
+                "median_candidate_minus_reference_makespan": (
+                    median(makespan_differences) if makespan_differences else None
+                ),
+                "candidate_faster_count": sum(
+                    difference < 0 for difference in makespan_differences
+                ),
+                "reference_faster_count": sum(
+                    difference > 0 for difference in makespan_differences
+                ),
+                "makespan_tie_count": sum(
+                    difference == 0 for difference in makespan_differences
+                ),
+                "mean_candidate_minus_reference_net_cost": mean(cost_differences),
+            }
+        )
+    return comparisons
+
+
 def compare_schedulers(agents, episodes: int, eval_seed: int):
     config = validate_eval_configs(agents)
     pool = build_independent_pool(config, episodes, eval_seed)
@@ -221,33 +364,41 @@ def summarize_hrl(rows):
     summary = []
     for label, model_rows in grouped.items():
         successful = [row for row in model_rows if row["success"]]
-        summary.append(
-            {
-                "model": label,
-                "episodes": len(model_rows),
-                "success_rate": len(successful) / max(len(model_rows), 1),
-                "mean_success_makespan": (
-                    mean(row["makespan"] for row in successful)
-                    if successful
-                    else None
-                ),
-                "mean_net_cost": mean(row["net_cost"] for row in model_rows),
-                "mean_peak_net_cost": mean(
-                    row.get("peak_net_cost", row["net_cost"])
-                    for row in model_rows
-                ),
-                "mean_architecture_changes": mean(
-                    row["architecture_changes"] for row in model_rows
-                ),
-                "budget_violation_rate": mean(
-                    float(row["budget_violation"]) for row in model_rows
-                ),
-                "ever_budget_violation_rate": mean(
-                    float(row.get("ever_over_budget", row["budget_violation"]))
-                    for row in model_rows
-                ),
-            }
-        )
+        model_summary = {
+            "model": label,
+            "episodes": len(model_rows),
+            "success_rate": len(successful) / max(len(model_rows), 1),
+            "mean_success_makespan": (
+                mean(row["makespan"] for row in successful)
+                if successful
+                else None
+            ),
+            "mean_net_cost": mean(row["net_cost"] for row in model_rows),
+            "mean_peak_net_cost": mean(
+                row.get("peak_net_cost", row["net_cost"])
+                for row in model_rows
+            ),
+            "mean_architecture_changes": mean(
+                row["architecture_changes"] for row in model_rows
+            ),
+            "budget_violation_rate": mean(
+                float(row["budget_violation"]) for row in model_rows
+            ),
+            "ever_budget_violation_rate": mean(
+                float(row.get("ever_over_budget", row["budget_violation"]))
+                for row in model_rows
+            ),
+        }
+        for field in (
+            "policy_parameter_count",
+            "mean_architecture_inference_ms",
+            "mean_scheduler_inference_ms",
+            "peak_gpu_memory_mb",
+        ):
+            values = [row[field] for row in model_rows if field in row]
+            if values:
+                model_summary[field] = mean(values)
+        summary.append(model_summary)
     return summary
 
 

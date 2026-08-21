@@ -1,5 +1,24 @@
 # SOSRL 双层强化学习算法说明书
 
+## Direct GP 上层策略
+
+项目现已支持用单棵 Genetic Programming 表达式树直接选择具体体系架构动作。GP在每次下层决策前对当前合法的KEEP、ADD、REMOVE和同类REPLACE候选评分；动作执行并刷新可行性后，冻结的Branching DQN再选择前沿task与active system。GP不再经过六个人工规则，也不会更新下层网络。
+
+安装GP依赖：
+
+```powershell
+& 'D:\software\anaconda3\envs\RL_env\python.exe' -m pip install -r requirements-gp.txt
+```
+
+标准实验可通过以下脚本启动：
+
+```powershell
+.\run_gp_architecture.ps1 `
+  -SchedulerCheckpoint runs\branching_scheduler\branching_scheduler.pt
+```
+
+也可以分别使用三个入口：`generate-gp-scenarios`、`train-gp-architecture`和`evaluate-gp-stack`。完整设计与复现参数见[实施说明](docs/plans/2026-08-20-direct-gp-architecture.md)，论文方法表述见[GP方法章节](docs/paper/gp_architecture_methodology.md)。
+
 本文档说明当前 SOSRL 双层强化学习算法的输入、输出、状态、动作、奖励、经验回放、训练过程和评估方法。它用于回答“算法如何运行和复现”，不作为源码阅读教程或论文方法章节。
 
 当前算法名称可表述为：
@@ -783,6 +802,7 @@ while mission 未完成：
 | Fixed Architecture Rules  | 能 KEEP 就 KEEP，否则选编号最小的救援规则 |
 | Random Architecture Rules | 在有效架构规则中随机选择                  |
 | Full System Reference     | 激活完整候选池后运行 Scheduler            |
+| Flat Rule DQN             | 单网络从 6×4 个联合规则动作中选择         |
 | Flat IntDQN               | 直接选择 assignment 的扁平 DQN 对照       |
 
 主要指标：
@@ -900,7 +920,67 @@ python -m sosrl evaluate `
   --output-dir runs/hrl_evaluation_seed4
 ```
 
-### 16.5 扁平基线与 Scheduler 配对比较
+### 16.5 联合规则 Flat-DQN
+
+```powershell
+python -m sosrl train-flat-rules `
+  --scenario-pool-size 100 `
+  --max-env-steps 240000 `
+  --budget 8000 `
+  --refund-rate 0.8 `
+  --n-step 5 `
+  --lr 0.0001 `
+  --hidden-dim 128 `
+  --seed 4 `
+  --device cuda `
+  --output-dir runs/flat_rules_seed4
+
+python -m sosrl evaluate `
+  --checkpoint runs/hrl_budget20_seed4/architecture_1000/hrl.pt `
+  --flat-rule-model flat_rule_dqn=runs/flat_rules_seed4/flat_rules.pt `
+  --eval-episodes 100 `
+  --eval-seed 20260724 `
+  --device cuda `
+  --output-dir runs/hrl_flat_rules_evaluation_seed4
+```
+
+联合动作编码为 `joint_action = architecture_action * 4 + scheduling_action`。
+`--max-env-steps` 达到目标后先完成当前 episode，因此实际步数可能最多超出
+一个 mission 的 operation 数减一。六种子完整运行可使用
+`run_flat_rules_multiseed.ps1`。
+
+### 16.6 冻结 Architecture DQN 的受约束加性 BDQN
+
+```powershell
+python -m sosrl train-branching-scheduler `
+  --architecture-checkpoint runs/hrl_architecture_seed4/architecture.pt `
+  --scenario-pool-size 100 `
+  --max-env-steps 240000 `
+  --lr 0.0001 `
+  --batch-size 64 `
+  --buffer-size 50000 `
+  --min-buffer-size 1000 `
+  --target-update-interval 250 `
+  --seed 4 `
+  --device cuda `
+  --output-dir runs/branching_scheduler_seed4
+
+python -m sosrl evaluate `
+  --checkpoint runs/branching_scheduler_seed4/architecture_branching.pt `
+  --eval-episodes 100 `
+  --eval-seed 20260724 `
+  --device cuda `
+  --output-dir runs/branching_evaluation_seed4
+```
+
+下层直接选择当前前沿任务与 active system 的合法组合。网络分别输出 task 和
+system 优势，通过合法 pair mask 在广播得到的矩阵上做全局 argmax；探索同样从
+合法动作对中联合采样。输出包括 `branching_scheduler.pt`、
+`architecture_branching.pt`、`branching_history.csv` 和
+`branching_config.json`。算法定义、特征 schema 和时序约束见
+[`docs/paper/branching_scheduler_methodology.md`](docs/paper/branching_scheduler_methodology.md)。
+
+### 16.7 Assignment级扁平基线与 Scheduler 配对比较
 
 ```powershell
 python -m sosrl train-flat --episodes 1000 --seed 1
@@ -951,7 +1031,16 @@ hrl_config.json
 ```text
 results.csv
 summary.csv
+paired_comparisons.csv  # 提供 --flat-rule-model 时生成
 evaluation_manifest.json
+```
+
+### 联合规则 Flat-DQN
+
+```text
+flat_rules.pt
+flat_rules_history.csv
+flat_rules_config.json
 ```
 
 `hrl.pt` 是组合 checkpoint，包含两个策略的 online network、target network、optimizer、配置和训练进度。Replay Buffer 不写入 checkpoint。
@@ -988,8 +1077,8 @@ evaluation_manifest.json
 | Scheduler、Huang 与 Architecture 规则         | `sosrl/rules/`                               |
 | 网络、Replay、配置与 checkpoint               | `sosrl/rl/`                                  |
 | 场景、episode、训练与评估                     | `sosrl/workflows/`                           |
-| 扁平 IntDQN 对照                              | `sosrl/baselines/`                           |
-| 六个统一命令                                  | `sosrl/cli.py`、`sosrl/__main__.py`          |
+| 联合规则 Flat-DQN 与 assignment IntDQN 对照   | `sosrl/baselines/`                           |
+| 七个统一命令                                  | `sosrl/cli.py`、`sosrl/__main__.py`          |
 | 绘图和成本轨迹报告                            | `scripts/`                                   |
 | 环境与算法测试                                | `tests/`                                     |
 

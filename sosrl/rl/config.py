@@ -73,3 +73,26 @@ class IntDQNConfig:
     seed: int = 1
     device: str = default_device()
     log_interval: int = 10
+
+
+@dataclass
+class BranchingDQNConfig:
+    """Training configuration for the constrained additive branching scheduler."""
+
+    episodes: int = 2000
+    max_env_steps: int | None = 240000
+    scenario_pool_size: int = 100
+    budget: float = 8000.0
+    refund_rate: float = 0.8
+    gamma: float = 0.99
+    lr: float = 1e-4
+    batch_size: int = 64
+    buffer_size: int = 50000
+    min_buffer_size: int = 1000
+    target_update_interval: int = 250
+    epsilon_start: float = 1.0
+    epsilon_end: float = 0.05
+    epsilon_decay: float = 0.995
+    seed: int = 1
+    device: str = default_device()
+    log_interval: int = 10

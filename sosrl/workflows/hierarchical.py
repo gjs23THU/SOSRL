@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import random
+from time import perf_counter
 
 import numpy as np
+import torch
 
 from .. import domain as syn
 from .. import environment as env
@@ -125,6 +127,19 @@ def _add_n_step(agent, accumulator, transition):
         agent.replay.add(*emitted)
 
 
+def _synchronize_policy(policy) -> None:
+    device = getattr(policy, "device", None)
+    if device is not None and torch.device(device).type == "cuda":
+        torch.cuda.synchronize(torch.device(device))
+
+
+def _policy_parameter_count(policy) -> int:
+    network = getattr(policy, "q_net", None)
+    if network is None:
+        return 0
+    return int(sum(parameter.numel() for parameter in network.parameters()))
+
+
 def run_episode(
     mission_env: env.MissionEnv,
     architecture_agent: ArchitectureDQNAgent,
@@ -135,6 +150,7 @@ def run_episode(
     update_architecture: bool,
     update_scheduler: bool,
     store_experience: bool = True,
+    measure_inference: bool = False,
 ):
     architecture_policy = archrule.ArchitectureRule(mission_env)
     scheduler_policy = rule.Rule(mission_env)
@@ -154,6 +170,10 @@ def run_episode(
     last_arch_loss = None
     last_scheduler_loss = None
     info = {"success": False, "dead_end": False}
+    architecture_inference_seconds = 0.0
+    scheduler_inference_seconds = 0.0
+    architecture_decisions = 0
+    scheduler_decisions = 0
 
     for _ in range(mission_env.T * mission_env.O + mission_env.N):
         arch_obs = mission_env.architecture_observation()
@@ -170,11 +190,18 @@ def run_episode(
                 pending_scheduler = None
             break
 
+        if measure_inference:
+            _synchronize_policy(architecture_agent)
+            inference_start = perf_counter()
         arch_action = architecture_agent.select_action(
             arch_obs,
             arch_mask,
             architecture_epsilon,
         )
+        if measure_inference:
+            _synchronize_policy(architecture_agent)
+            architecture_inference_seconds += perf_counter() - inference_start
+        architecture_decisions += 1
         rule_counts[arch_action] += 1
         old_makespan = float(mission_env.state.current_makespan)
         old_cost = float(mission_env.net_cost)
@@ -218,11 +245,18 @@ def run_episode(
             break
 
 
+        if measure_inference:
+            _synchronize_policy(scheduler_agent)
+            inference_start = perf_counter()
         schedule_action = scheduler_agent.select_action(
             schedule_obs,
             schedule_mask,
             scheduler_epsilon,
         )
+        if measure_inference:
+            _synchronize_policy(scheduler_agent)
+            scheduler_inference_seconds += perf_counter() - inference_start
+        scheduler_decisions += 1
         schedule_rule_counts[schedule_action] += 1
         env_action = scheduler_policy.to_env_action(schedule_action)
         next_schedule_obs, base_reward, terminated, _, info = mission_env.step(env_action)
@@ -286,6 +320,11 @@ def run_episode(
         "scheduler_rule_counts": schedule_rule_counts,
         "success": bool(info.get("success", False)),
         "dead_end": bool(info.get("dead_end", False)),
+        "architecture_inference_seconds": float(architecture_inference_seconds),
+        "scheduler_inference_seconds": float(scheduler_inference_seconds),
+        "architecture_decisions": int(architecture_decisions),
+        "scheduler_decisions": int(scheduler_decisions),
+        "inference_measured": bool(measure_inference),
     }
 
 
@@ -391,6 +430,19 @@ def episode_row(episode, category, mission_env, result, epsilon):
         "epsilon": float(epsilon),
     }
     row.update(mission_env.cost_metrics())
+    if result.get("inference_measured", False):
+        architecture_decisions = max(int(result["architecture_decisions"]), 1)
+        scheduler_decisions = max(int(result["scheduler_decisions"]), 1)
+        row["mean_architecture_inference_ms"] = (
+            1000.0
+            * float(result["architecture_inference_seconds"])
+            / architecture_decisions
+        )
+        row["mean_scheduler_inference_ms"] = (
+            1000.0
+            * float(result["scheduler_inference_seconds"])
+            / scheduler_decisions
+        )
     for index, name in enumerate(archrule.ArchitectureRule.RULE_NAMES):
         row[f"arch_{name.lower()}_count"] = int(
             result["architecture_rule_counts"][index]
@@ -409,6 +461,10 @@ def evaluate_hrl(
     budget=8000.0,
     refund_rate=0.8,
 ):
+    parameter_count = _policy_parameter_count(
+        architecture_agent
+    ) + _policy_parameter_count(scheduler_agent)
+    device = torch.device(scheduler_agent.device)
     results = []
     for episode, scenario in enumerate(scenarios):
         if len(scenario) == 3:
@@ -423,6 +479,9 @@ def evaluate_hrl(
             budget=budget,
             refund_rate=refund_rate,
         )
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
         result = run_episode(
             mission_env,
             architecture_agent,
@@ -432,9 +491,16 @@ def evaluate_hrl(
             update_architecture=False,
             update_scheduler=False,
             store_experience=False,
+            measure_inference=True,
         )
         row = episode_row(episode, category, mission_env, result, 0.0)
         row["scenario_hash"] = scenario_hash(architecture, mission)
+        row["policy_parameter_count"] = parameter_count
+        row["peak_gpu_memory_mb"] = (
+            float(torch.cuda.max_memory_allocated(device)) / (1024.0**2)
+            if device.type == "cuda"
+            else 0.0
+        )
         results.append(row)
     return results
 

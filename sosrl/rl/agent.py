@@ -235,6 +235,19 @@ class ArchitectureDQNAgent:
         return float(loss.item())
 
 
+class FlatRuleDQNAgent(ArchitectureDQNAgent):
+    """Single-policy DQN over architecture/scheduling rule pairs."""
+
+    checkpoint_kind = "flat_rules"
+    ACTION_DIM = 24
+
+    @classmethod
+    def load_checkpoint(cls, path, device=None, load_optimizer=True):
+        from .checkpoint import load_flat_rules_checkpoint
+
+        return load_flat_rules_checkpoint(path, device, load_optimizer)
+
+
 class IntDQNAgent:
     """Assignment-level flat DQN retained as a baseline."""
 

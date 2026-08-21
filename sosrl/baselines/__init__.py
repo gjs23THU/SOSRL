@@ -2,5 +2,6 @@
 
 from .flat import IntDQNAgent, IntDQNConfig
 from .flat_environment import IntEnv
+from .flat_rules import FlatRuleDQNAgent
 
-__all__ = ["IntDQNAgent", "IntDQNConfig", "IntEnv"]
+__all__ = ["FlatRuleDQNAgent", "IntDQNAgent", "IntDQNConfig", "IntEnv"]

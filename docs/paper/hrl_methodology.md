@@ -420,7 +420,7 @@ Scheduler replay 存储
 其目标值为
 
 \[
-y_t^S=r_t^S+gamma(1-d_t)
+y_t^S=r_t^S+\gamma(1-d_t)
 \max_{a:m_{t+1}^S(a)=1}Q_S^-(s_{t+1}^S,a).
 \]
 
@@ -451,7 +451,7 @@ buffer 存储
 目标值为
 
 \[
-y_t^A=R_t^{(k)}+gamma^k(1-d_{t+k-1})
+y_t^A=R_t^{(k)}+\gamma^k(1-d_{t+k-1})
 \max_{a:m_{t+k}^A(a)=1}Q_A^-(s_{t+k}^A,a).
 \]
 
