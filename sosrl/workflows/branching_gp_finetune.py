@@ -977,13 +977,29 @@ def _plot_paired_effects(path: Path, paired: dict[str, Any]) -> None:
         "delta_architecture_changes",
     ]
     labels = ["J", "makespan", "final cost", "peak cost", "arch changes"]
-    values = [float(paired[name]["mean"] or 0.0) for name in names]
-    colors = ["#2e7d32" if value < 0 else "#c62828" for value in values]
-    figure, axis = plt.subplots(figsize=(9, 4.5))
-    axis.bar(labels, values, color=colors)
-    axis.axhline(0.0, color="black", linewidth=0.8)
-    axis.set_ylabel("B1 - B0")
-    axis.set_title("Paired validation effects")
+    figure, axes = plt.subplots(1, len(names), figsize=(12, 4.5))
+    for axis, name, label in zip(axes, names, labels, strict=True):
+        record = paired[name]
+        value = float(record["mean"] or 0.0)
+        low = float(record["ci95_low"] if record["ci95_low"] is not None else value)
+        high = float(record["ci95_high"] if record["ci95_high"] is not None else value)
+        color = "#2e7d32" if value < 0 else "#c62828"
+        axis.bar([0], [value], color=color, width=0.6)
+        axis.vlines(0.0, low, high, color="black", linewidth=1.0)
+        axis.hlines((low, high), -0.08, 0.08, color="black", linewidth=1.0)
+        axis.axhline(0.0, color="black", linewidth=0.8)
+        axis.set_xticks([])
+        axis.set_title(label)
+        axis.set_ylabel("B1 - B0")
+        axis.text(
+            0.0,
+            value,
+            f" {value:.3g}",
+            ha="center",
+            va="bottom" if value >= 0 else "top",
+            fontsize=9,
+        )
+    figure.suptitle("Paired validation effects with 95% bootstrap CI")
     figure.tight_layout()
     figure.savefig(path, dpi=160)
     plt.close(figure)
@@ -996,6 +1012,7 @@ def _write_report(
     selection: dict[str, Any],
     paired: dict[str, Any],
     action_comparison: dict[str, Any],
+    historical_summaries: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     overall = [row for row in summaries if row["category"] == "all"]
     lines = [
@@ -1030,6 +1047,38 @@ def _write_report(
             f"- J win/tie/loss：{paired['j_win_tie_loss']}。",
             f"- 完整 G0 动作序列一致率：{action_comparison['exact_sequence_rate']:.4f}。",
             f"- 对齐步骤动作一致率：{action_comparison['aligned_action_agreement']:.4f}。",
+        ]
+    )
+    if historical_summaries:
+        lines.extend(
+            [
+                "",
+                "## 历史 IID/OOD 描述性复核",
+                "",
+                "阶段标记：`historical_test_diagnostic`。",
+                "",
+                "|数据集|模型|失败率|mean J|成功 makespan|预算违规率|架构变化|",
+                "|---|---|---:|---:|---:|---:|---:|",
+            ]
+        )
+        historical_delta_lines = []
+        for split, summary in historical_summaries.items():
+            for row in summary["summaries"]:
+                if row["category"] != "all":
+                    continue
+                lines.append(
+                    "|{split}|{model}|{failure_rate:.4f}|{mean_j:.6f}|"
+                    "{mean_success_makespan:.4f}|{budget_violation_rate:.4f}|"
+                    "{mean_architecture_changes:.4f}|".format(split=split.upper(), **row)
+                )
+            delta = summary["paired"]["delta_j"]
+            historical_delta_lines.append(
+                f"{split.upper()} ΔJ={delta['mean']:.6f}，95% CI "
+                f"[{delta['ci95_low']:.6f}, {delta['ci95_high']:.6f}]。"
+            )
+        lines.extend(["", *historical_delta_lines])
+    lines.extend(
+        [
             "",
             "## 解释边界",
             "",
@@ -1050,7 +1099,7 @@ def _evaluate_historical_split(
     loaded_gp_policy,
     device: str,
     seed: int,
-) -> None:
+) -> dict[str, Any]:
     split_dir = output_dir / "historical_test" / split
     split_dir.mkdir(parents=True, exist_ok=True)
     rows_by_model: dict[str, list[dict[str, Any]]] = {}
@@ -1083,6 +1132,7 @@ def _evaluate_historical_split(
         ),
     }
     _write_json_atomic(split_dir / "summary.json", summary)
+    return summary
 
 
 def finetune_branching_with_frozen_gp(
@@ -1329,6 +1379,7 @@ def finetune_branching_with_frozen_gp(
     )
 
     historical_status: dict[str, Any]
+    historical_summaries: dict[str, dict[str, Any]] = {}
     if skip_historical_test:
         historical_status = {"status": "skipped_by_request"}
     elif not selection["adaptation_accepted"]:
@@ -1344,7 +1395,7 @@ def finetune_branching_with_frozen_gp(
             "B0": scheduler_path,
             "B1": model_paths[selection["selected_model"]],
         }
-        _evaluate_historical_split(
+        historical_summaries["iid"] = _evaluate_historical_split(
             output_dir=destination,
             split="iid",
             scenarios=test_iid_manifest["scenarios"],
@@ -1353,7 +1404,7 @@ def finetune_branching_with_frozen_gp(
             device=resolved_device,
             seed=seed + 1000,
         )
-        _evaluate_historical_split(
+        historical_summaries["ood"] = _evaluate_historical_split(
             output_dir=destination,
             split="ood",
             scenarios=test_ood_manifest["scenarios"],
@@ -1386,6 +1437,7 @@ def finetune_branching_with_frozen_gp(
         selection=selection,
         paired=paired,
         action_comparison=action_comparison,
+        historical_summaries=historical_summaries,
     )
     if loaded_gp.artifact.to_dict() != original_gp:
         raise RuntimeError("loaded G0 policy changed during the workflow.")
