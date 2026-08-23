@@ -64,7 +64,8 @@ from .branching import branching_episode_row, run_branching_episode
 from .hierarchical import AdaptiveScenarioPool
 
 
-GP_SCENARIO_SCHEMA_VERSION = 1
+GP_SCENARIO_SCHEMA_VERSION = 2
+SUPPORTED_GP_SCENARIO_SCHEMA_VERSIONS = (1, 2)
 SCENARIO_CATEGORIES = AdaptiveScenarioPool.CATEGORIES
 DEFAULT_REFUND_RATE = 0.8
 _WORKER_AGENT = None
@@ -115,7 +116,7 @@ def load_scenario_manifest(path: str | Path) -> dict[str, Any]:
     expected = payload.pop("manifest_hash", None)
     actual = _canonical_hash(payload)
     payload["manifest_hash"] = expected
-    if payload.get("schema_version") != GP_SCENARIO_SCHEMA_VERSION:
+    if payload.get("schema_version") not in SUPPORTED_GP_SCENARIO_SCHEMA_VERSIONS:
         raise ValueError("unsupported GP scenario manifest schema.")
     if expected != actual:
         raise ValueError("GP scenario manifest hash mismatch.")
@@ -149,6 +150,7 @@ def _make_scenario(
         budget=budget,
         refund_rate=DEFAULT_REFUND_RATE,
         split=split,
+        static_feasible_architecture=feasible,
     )
 
 

@@ -327,10 +327,15 @@ def branching_episode_row(
         "dead_end": result["dead_end"],
         "makespan": float(mission_env.state.current_makespan),
         "net_cost": float(mission_env.net_cost),
+        "peak_net_cost": float(mission_env.peak_net_cost),
+        "budget": float(mission_env.budget),
         "active_cost": float(mission_env.active_cost),
         "total_refund": float(mission_env.total_refund),
         "architecture_changes": int(mission_env.architecture_change_count),
         "budget_violation": bool(mission_env.net_cost > mission_env.budget),
+        "process_budget_violation": bool(
+            mission_env.peak_net_cost > mission_env.budget
+        ),
         "assigned_ops": int(np.sum(mission_env.state.task_op_idx)),
         "epsilon": float(epsilon),
         "assignment_steps": int(result["assignment_steps"]),

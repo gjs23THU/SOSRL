@@ -94,7 +94,7 @@ def save_json(path: Path, payload) -> None:
 
 
 def print_json(payload) -> None:
-    print(json.dumps(payload, ensure_ascii=False, indent=2))
+    print(json.dumps(payload, ensure_ascii=False, indent=2, default=str))
 
 
 def add_device(parser) -> None:
@@ -408,6 +408,85 @@ def build_parser() -> argparse.ArgumentParser:
     finetune_branching_gp.set_defaults(
         handler=handle_finetune_branching_with_gp
     )
+
+    round1_scenarios = subparsers.add_parser("generate-round1-scenarios")
+    round1_scenarios.add_argument("--base-seed", type=int, default=20260824)
+    round1_scenarios.add_argument("--b-train-size", type=int, default=256)
+    round1_scenarios.add_argument("--b-validation-size", type=int, default=256)
+    round1_scenarios.add_argument("--g-train-size", type=int, default=256)
+    round1_scenarios.add_argument("--g-validation-size", type=int, default=256)
+    round1_scenarios.add_argument("--test-iid-size", type=int, default=1000)
+    round1_scenarios.add_argument("--test-ood-size", type=int, default=500)
+    round1_scenarios.add_argument("--output-dir", type=Path, required=True)
+    round1_scenarios.set_defaults(handler=handle_generate_round1_scenarios)
+
+    round1_cell = subparsers.add_parser("train-round1-bdqn-cell")
+    round1_cell.add_argument(
+        "--provider", choices=["fixed", "arch", "g0"], required=True
+    )
+    round1_cell.add_argument(
+        "--mode", choices=["scratch", "finetune"], default="scratch"
+    )
+    round1_cell.add_argument("--source-checkpoint", type=Path, required=True)
+    round1_cell.add_argument("--architecture-checkpoint", type=Path)
+    round1_cell.add_argument("--gp-policy", type=Path)
+    round1_cell.add_argument("--train-manifest", type=Path, required=True)
+    round1_cell.add_argument("--validation-manifest", type=Path, required=True)
+    round1_cell.add_argument("--output-dir", type=Path, required=True)
+    round1_cell.add_argument("--seed", type=int, required=True)
+    round1_cell.add_argument("--max-env-steps", type=int)
+    round1_cell.add_argument("--checkpoint-steps", nargs="+", type=int)
+    round1_cell.add_argument("--lr", type=float)
+    round1_cell.add_argument("--batch-size", type=int)
+    round1_cell.add_argument("--buffer-size", type=int)
+    round1_cell.add_argument("--target-update-interval", type=int)
+    round1_cell.add_argument("--epsilon-start", type=float)
+    round1_cell.add_argument("--epsilon-end", type=float)
+    round1_cell.add_argument("--epsilon-decay", type=float)
+    add_device(round1_cell)
+    round1_cell.set_defaults(handler=handle_train_round1_bdqn_cell)
+
+    round1_init = subparsers.add_parser("init-round1-study")
+    round1_init.add_argument("--architecture-checkpoint", type=Path, required=True)
+    round1_init.add_argument("--gp-policy", type=Path, required=True)
+    round1_init.add_argument("--output-dir", type=Path, required=True)
+    round1_init.add_argument("--base-seed", type=int, default=20260824)
+    round1_init.add_argument("--b-train-size", type=int, default=256)
+    round1_init.add_argument("--b-validation-size", type=int, default=256)
+    round1_init.add_argument("--g-train-size", type=int, default=256)
+    round1_init.add_argument("--g-validation-size", type=int, default=256)
+    round1_init.add_argument("--test-iid-size", type=int, default=1000)
+    round1_init.add_argument("--test-ood-size", type=int, default=500)
+    add_device(round1_init)
+    round1_init.set_defaults(handler=handle_initialize_round1_study)
+
+    round1_run = subparsers.add_parser("run-round1-study")
+    round1_run.add_argument("--study-manifest", type=Path, required=True)
+    round1_run.add_argument(
+        "--stage",
+        choices=[
+            "convergence",
+            "cross",
+            "migration",
+            "hyper-screen",
+            "hyper-confirm",
+            "gp-discovery",
+            "gp-confirm",
+            "final-test",
+            "report",
+            "all",
+        ],
+        required=True,
+    )
+    round1_run.add_argument("--workers", type=int, default=8)
+    round1_run.set_defaults(handler=handle_run_round1_study)
+
+    round1_smoke = subparsers.add_parser("smoke-round1-study")
+    round1_smoke.add_argument("--architecture-checkpoint", type=Path, required=True)
+    round1_smoke.add_argument("--gp-policy", type=Path, required=True)
+    round1_smoke.add_argument("--output-dir", type=Path, required=True)
+    round1_smoke.add_argument("--seed", type=int, default=20260824)
+    round1_smoke.set_defaults(handler=handle_smoke_round1_study)
     return parser
 
 
@@ -1146,6 +1225,117 @@ def handle_finetune_branching_with_gp(args) -> None:
         skip_historical_test=args.skip_historical_test,
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_generate_round1_scenarios(args) -> None:
+    from .workflows.round1_study import generate_round1_scenarios
+
+    outputs = generate_round1_scenarios(
+        args.output_dir,
+        base_seed=args.base_seed,
+        b_train_size=args.b_train_size,
+        b_validation_size=args.b_validation_size,
+        g_train_size=args.g_train_size,
+        g_validation_size=args.g_validation_size,
+        test_iid_size=args.test_iid_size,
+        test_ood_size=args.test_ood_size,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_train_round1_bdqn_cell(args) -> None:
+    from .workflows.round1_study import (
+        DEFAULT_CONVERGENCE_STEPS,
+        DEFAULT_TRANSFER_STEPS,
+        baseline_bdqn_config,
+        finetune_bdqn_config,
+        train_bdqn_provider_cell,
+    )
+
+    default_steps = (
+        DEFAULT_CONVERGENCE_STEPS
+        if args.mode == "scratch"
+        else DEFAULT_TRANSFER_STEPS
+    )
+    steps = tuple(args.checkpoint_steps or default_steps)
+    max_steps = int(args.max_env_steps or max(steps))
+    factory = (
+        baseline_bdqn_config
+        if args.mode == "scratch"
+        else finetune_bdqn_config
+    )
+    config = factory(seed=args.seed, max_env_steps=max_steps, device=args.device)
+    overrides = {
+        "lr": args.lr,
+        "batch_size": args.batch_size,
+        "buffer_size": args.buffer_size,
+        "target_update_interval": args.target_update_interval,
+        "epsilon_start": args.epsilon_start,
+        "epsilon_end": args.epsilon_end,
+        "epsilon_decay": args.epsilon_decay,
+    }
+    config = BranchingDQNConfig(
+        **{
+            **asdict(config),
+            **{name: value for name, value in overrides.items() if value is not None},
+        }
+    )
+    outputs = train_bdqn_provider_cell(
+        output_dir=args.output_dir,
+        provider_kind=args.provider,
+        source_checkpoint=args.source_checkpoint,
+        train_manifest=args.train_manifest,
+        validation_manifest=args.validation_manifest,
+        config=config,
+        checkpoint_steps=steps,
+        architecture_checkpoint=args.architecture_checkpoint,
+        gp_policy=args.gp_policy,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_initialize_round1_study(args) -> None:
+    from .workflows.round1_study import initialize_round1_study
+
+    manifest = initialize_round1_study(
+        output_dir=args.output_dir,
+        architecture_checkpoint=args.architecture_checkpoint,
+        gp_policy=args.gp_policy,
+        base_seed=args.base_seed,
+        device=args.device,
+        scenario_sizes={
+            "b_train_size": args.b_train_size,
+            "b_validation_size": args.b_validation_size,
+            "g_train_size": args.g_train_size,
+            "g_validation_size": args.g_validation_size,
+            "test_iid_size": args.test_iid_size,
+            "test_ood_size": args.test_ood_size,
+        },
+    )
+    print_json({"study_manifest": str(manifest.resolve())})
+
+
+def handle_run_round1_study(args) -> None:
+    from .workflows.round1_study import run_round1_stage
+
+    result = run_round1_stage(
+        args.study_manifest,
+        args.stage,
+        workers=args.workers,
+    )
+    print_json({"stage": args.stage, "result": result})
+
+
+def handle_smoke_round1_study(args) -> None:
+    from .workflows.round1_study import run_round1_smoke
+
+    result = run_round1_smoke(
+        output_dir=args.output_dir,
+        architecture_checkpoint=args.architecture_checkpoint,
+        gp_policy=args.gp_policy,
+        seed=args.seed,
+    )
+    print_json(result)
 
 
 def main(argv=None) -> None:

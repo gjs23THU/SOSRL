@@ -70,6 +70,7 @@ class GPWorkflowTest(unittest.TestCase):
             ood = load_scenario_manifest(paths["test_ood"])
 
         self.assertEqual(first["manifest_hash"], second["manifest_hash"])
+        self.assertEqual(first["schema_version"], 2)
         self.assertEqual(
             {item["category"] for item in first["scenarios"]},
             set(SCENARIO_CATEGORIES),
@@ -81,6 +82,24 @@ class GPWorkflowTest(unittest.TestCase):
             sorted(item["budget"] for item in ood["scenarios"]),
             [6400.0, 6400.0, 9600.0, 9600.0],
         )
+        for item in first["scenarios"]:
+            self.assertIn("static_feasible_system_indices", item)
+            static_architecture, _ = evaluation.static_scenario_from_payload(item)
+            self.assertLessEqual(
+                sum(system.cost for system in static_architecture),
+                item["budget"],
+            )
+
+    def test_static_scenario_requires_registered_architecture(self):
+        func_type = int(env.FULL_SOS[0].func_type)
+        payload = evaluation.scenario_payload(
+            0,
+            (env.FULL_SOS[0],),
+            one_operation_mission(func_type),
+        )
+
+        with self.assertRaisesRegex(ValueError, "static feasible architecture"):
+            evaluation.static_scenario_from_payload(payload)
 
     def test_manifest_round_trip_reconstructs_full_mission(self):
         with tempfile.TemporaryDirectory() as temp_dir:

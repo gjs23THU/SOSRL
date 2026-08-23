@@ -90,6 +90,7 @@ def scenario_payload(
     budget=None,
     refund_rate=None,
     split=None,
+    static_feasible_architecture=None,
 ):
     payload = {
         "scenario_idx": int(scenario_idx),
@@ -104,6 +105,13 @@ def scenario_payload(
         "budget": None if budget is None else float(budget),
         "refund_rate": None if refund_rate is None else float(refund_rate),
         "split": split,
+        "static_feasible_system_indices": (
+            None
+            if static_feasible_architecture is None
+            else sorted(
+                int(system.index) for system in static_feasible_architecture
+            )
+        ),
     }
     payload.update({key: value for key, value in optional.items() if value is not None})
     canonical = json.dumps(
@@ -150,6 +158,16 @@ def scenario_from_payload(payload):
         env.FULL_SOS[int(index)]
         for index in payload["architecture_system_indices"]
     )
+    return architecture, mission_from_payload(payload["mission"])
+
+
+def static_scenario_from_payload(payload):
+    """Reconstruct the registered feasible static architecture and mission."""
+
+    indices = payload.get("static_feasible_system_indices")
+    if indices is None:
+        raise ValueError("scenario does not register a static feasible architecture.")
+    architecture = tuple(env.FULL_SOS[int(index)] for index in indices)
     return architecture, mission_from_payload(payload["mission"])
 
 

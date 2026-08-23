@@ -32,6 +32,11 @@ class UnifiedCliTests(unittest.TestCase):
                 "train-gp-architecture",
                 "evaluate-gp-stack",
                 "finetune-branching-with-gp",
+                "generate-round1-scenarios",
+                "train-round1-bdqn-cell",
+                "init-round1-study",
+                "run-round1-study",
+                "smoke-round1-study",
             },
         )
 
@@ -132,6 +137,75 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(finetune.checkpoint_interval_steps, 10000)
         self.assertTrue(finetune.resume)
         self.assertTrue(finetune.skip_historical_test)
+
+        round1_scenarios = parser.parse_args(
+            ["generate-round1-scenarios", "--output-dir", "round1"]
+        )
+        round1_cell = parser.parse_args(
+            [
+                "train-round1-bdqn-cell",
+                "--provider",
+                "g0",
+                "--mode",
+                "finetune",
+                "--source-checkpoint",
+                "b0.pt",
+                "--gp-policy",
+                "g0.json",
+                "--train-manifest",
+                "train.json",
+                "--validation-manifest",
+                "validation.json",
+                "--output-dir",
+                "cell",
+                "--seed",
+                "4",
+                "--checkpoint-steps",
+                "0",
+                "10",
+            ]
+        )
+        self.assertEqual(round1_scenarios.test_iid_size, 1000)
+        self.assertEqual(round1_cell.provider, "g0")
+        self.assertEqual(round1_cell.checkpoint_steps, [0, 10])
+
+        round1_init = parser.parse_args(
+            [
+                "init-round1-study",
+                "--architecture-checkpoint",
+                "arch.pt",
+                "--gp-policy",
+                "g0.json",
+                "--output-dir",
+                "round1",
+            ]
+        )
+        round1_run = parser.parse_args(
+            [
+                "run-round1-study",
+                "--study-manifest",
+                "round1/study_manifest.json",
+                "--stage",
+                "gp-discovery",
+                "--workers",
+                "4",
+            ]
+        )
+        self.assertEqual(round1_init.b_train_size, 256)
+        self.assertEqual(round1_run.stage, "gp-discovery")
+        self.assertEqual(round1_run.workers, 4)
+        round1_smoke = parser.parse_args(
+            [
+                "smoke-round1-study",
+                "--architecture-checkpoint",
+                "arch.pt",
+                "--gp-policy",
+                "g0.json",
+                "--output-dir",
+                "smoke",
+            ]
+        )
+        self.assertEqual(round1_smoke.seed, 20260824)
 
     def test_flat_rule_commands_parse_training_budget_and_models(self):
         parser, _ = self.subcommands()
