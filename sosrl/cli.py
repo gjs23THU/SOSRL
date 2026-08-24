@@ -101,6 +101,11 @@ def add_device(parser) -> None:
     parser.add_argument("--device", default="auto")
 
 
+def add_ss_thresholds(parser) -> None:
+    parser.add_argument("--ss-low-threshold", type=float, default=0.40)
+    parser.add_argument("--ss-high-threshold", type=float, default=0.90)
+
+
 def add_scheduler_arguments(parser) -> None:
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--scenario-pool-size", type=int, default=20)
@@ -368,9 +373,10 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_gp.add_argument(
         "--baselines",
         nargs="+",
-        choices=["fixed", "random_concrete", "manual6_dqn", "gp"],
-        default=["fixed", "random_concrete", "gp"],
+        choices=["fixed", "ss", "random_concrete", "manual6_dqn", "gp"],
+        default=["fixed", "ss", "random_concrete", "gp"],
     )
+    add_ss_thresholds(evaluate_gp)
     evaluate_gp.add_argument("--collect-schedule", action="store_true")
     evaluate_gp.add_argument("--device", default="cpu")
     evaluate_gp.add_argument(
@@ -422,8 +428,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     round1_cell = subparsers.add_parser("train-round1-bdqn-cell")
     round1_cell.add_argument(
-        "--provider", choices=["fixed", "arch", "g0"], required=True
+        "--provider", choices=["fixed", "ss", "arch", "g0"], required=True
     )
+    add_ss_thresholds(round1_cell)
     round1_cell.add_argument(
         "--mode", choices=["scratch", "finetune"], default="scratch"
     )
@@ -447,8 +454,9 @@ def build_parser() -> argparse.ArgumentParser:
     round1_cell.set_defaults(handler=handle_train_round1_bdqn_cell)
 
     round1_init = subparsers.add_parser("init-round1-study")
-    round1_init.add_argument("--architecture-checkpoint", type=Path, required=True)
-    round1_init.add_argument("--gp-policy", type=Path, required=True)
+    round1_init.add_argument("--architecture-checkpoint", type=Path)
+    round1_init.add_argument("--gp-policy", type=Path)
+    round1_init.add_argument("--augment-from", type=Path)
     round1_init.add_argument("--output-dir", type=Path, required=True)
     round1_init.add_argument("--base-seed", type=int, default=20260824)
     round1_init.add_argument("--b-train-size", type=int, default=256)
@@ -457,6 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
     round1_init.add_argument("--g-validation-size", type=int, default=256)
     round1_init.add_argument("--test-iid-size", type=int, default=1000)
     round1_init.add_argument("--test-ood-size", type=int, default=500)
+    add_ss_thresholds(round1_init)
     add_device(round1_init)
     round1_init.set_defaults(handler=handle_initialize_round1_study)
 
@@ -1188,6 +1197,7 @@ def handle_train_gp_architecture(args) -> None:
 
 
 def handle_evaluate_gp_stack(args) -> None:
+    from .baselines.hysteretic_capacity import HystereticCapacityConfig
     from .workflows import gp_architecture
 
     outputs = gp_architecture.evaluate_gp_stack(
@@ -1197,6 +1207,10 @@ def handle_evaluate_gp_stack(args) -> None:
         output_dir=args.output_dir,
         baselines=args.baselines,
         manual_architecture_checkpoint=args.manual_architecture_checkpoint,
+        ss_config=HystereticCapacityConfig(
+            lower_threshold=args.ss_low_threshold,
+            upper_threshold=args.ss_high_threshold,
+        ),
         device=resolve_device(args.device),
         collect_schedule=args.collect_schedule,
     )
@@ -1244,6 +1258,7 @@ def handle_generate_round1_scenarios(args) -> None:
 
 
 def handle_train_round1_bdqn_cell(args) -> None:
+    from .baselines.hysteretic_capacity import HystereticCapacityConfig
     from .workflows.round1_study import (
         DEFAULT_CONVERGENCE_STEPS,
         DEFAULT_TRANSFER_STEPS,
@@ -1290,11 +1305,16 @@ def handle_train_round1_bdqn_cell(args) -> None:
         checkpoint_steps=steps,
         architecture_checkpoint=args.architecture_checkpoint,
         gp_policy=args.gp_policy,
+        ss_config=HystereticCapacityConfig(
+            lower_threshold=args.ss_low_threshold,
+            upper_threshold=args.ss_high_threshold,
+        ),
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 
 
 def handle_initialize_round1_study(args) -> None:
+    from .baselines.hysteretic_capacity import HystereticCapacityConfig
     from .workflows.round1_study import initialize_round1_study
 
     manifest = initialize_round1_study(
@@ -1303,14 +1323,23 @@ def handle_initialize_round1_study(args) -> None:
         gp_policy=args.gp_policy,
         base_seed=args.base_seed,
         device=args.device,
-        scenario_sizes={
-            "b_train_size": args.b_train_size,
-            "b_validation_size": args.b_validation_size,
-            "g_train_size": args.g_train_size,
-            "g_validation_size": args.g_validation_size,
-            "test_iid_size": args.test_iid_size,
-            "test_ood_size": args.test_ood_size,
-        },
+        ss_config=HystereticCapacityConfig(
+            lower_threshold=args.ss_low_threshold,
+            upper_threshold=args.ss_high_threshold,
+        ),
+        augment_from=args.augment_from,
+        scenario_sizes=(
+            None
+            if args.augment_from is not None
+            else {
+                "b_train_size": args.b_train_size,
+                "b_validation_size": args.b_validation_size,
+                "g_train_size": args.g_train_size,
+                "g_validation_size": args.g_validation_size,
+                "test_iid_size": args.test_iid_size,
+                "test_ood_size": args.test_ood_size,
+            }
+        ),
     )
     print_json({"study_manifest": str(manifest.resolve())})
 

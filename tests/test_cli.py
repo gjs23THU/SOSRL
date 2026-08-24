@@ -1,6 +1,7 @@
 import argparse
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 from sosrl import cli
 
@@ -108,7 +109,12 @@ class UnifiedCliTests(unittest.TestCase):
                 "test_iid.json",
                 "--baselines",
                 "fixed",
+                "ss",
                 "gp",
+                "--ss-low-threshold",
+                "0.4",
+                "--ss-high-threshold",
+                "0.9",
             ]
         )
 
@@ -116,7 +122,9 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(train.population_size, 8)
         self.assertEqual(train.generations, 2)
         self.assertEqual(train.feature_set, "system_delta")
-        self.assertEqual(evaluate.baselines, ["fixed", "gp"])
+        self.assertEqual(evaluate.baselines, ["fixed", "ss", "gp"])
+        self.assertEqual(evaluate.ss_low_threshold, 0.4)
+        self.assertEqual(evaluate.ss_high_threshold, 0.9)
 
         finetune = parser.parse_args(
             [
@@ -168,6 +176,24 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(round1_scenarios.test_iid_size, 1000)
         self.assertEqual(round1_cell.provider, "g0")
         self.assertEqual(round1_cell.checkpoint_steps, [0, 10])
+        ss_cell = parser.parse_args(
+            [
+                "train-round1-bdqn-cell",
+                "--provider",
+                "ss",
+                "--source-checkpoint",
+                "b0.pt",
+                "--train-manifest",
+                "train.json",
+                "--validation-manifest",
+                "validation.json",
+                "--output-dir",
+                "cell",
+                "--seed",
+                "4",
+            ]
+        )
+        self.assertEqual(ss_cell.provider, "ss")
 
         round1_init = parser.parse_args(
             [
@@ -194,6 +220,36 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(round1_init.b_train_size, 256)
         self.assertEqual(round1_run.stage, "gp-discovery")
         self.assertEqual(round1_run.workers, 4)
+        round1_augment = parser.parse_args(
+            [
+                "init-round1-study",
+                "--augment-from",
+                "round1/study_manifest.json",
+                "--output-dir",
+                "round1-v2",
+            ]
+        )
+        self.assertEqual(
+            round1_augment.augment_from,
+            Path("round1/study_manifest.json"),
+        )
+        with patch(
+            "sosrl.workflows.round1_study.initialize_round1_study",
+            return_value=Path("round1-v2/study_manifest.json"),
+        ) as initialize:
+            round1_augment.handler(round1_augment)
+        self.assertEqual(
+            initialize.call_args.kwargs["augment_from"],
+            Path("round1/study_manifest.json"),
+        )
+
+        with patch(
+            "sosrl.workflows.round1_study.train_bdqn_provider_cell",
+            return_value={"manifest": Path("cell/cell_manifest.json")},
+        ) as train_cell:
+            ss_cell.handler(ss_cell)
+        self.assertEqual(train_cell.call_args.kwargs["provider_kind"], "ss")
+        self.assertNotIn("augment_from", train_cell.call_args.kwargs)
         round1_smoke = parser.parse_args(
             [
                 "smoke-round1-study",

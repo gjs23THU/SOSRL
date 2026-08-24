@@ -1,18 +1,30 @@
+import json
 from pathlib import Path
 import tempfile
 
 from sosrl import domain as syn
 from sosrl import environment as env
+from sosrl.baselines.hysteretic_capacity import HystereticCapacityConfig
 from sosrl.rl.config import BranchingDQNConfig
 from sosrl.rl.checkpoint import load_branching_checkpoint
+from sosrl.gp.artifact import sha256_file
 from sosrl.workflows import evaluation
 from sosrl.workflows.gp_architecture import save_scenario_manifest
 from sosrl.workflows.round1_study import (
+    LEGACY_PROVIDER_KINDS,
     PROVIDER_KINDS,
+    ROUND1_MANIFEST_SCHEMA_VERSION,
+    _convergence_cell_directories,
+    _load_study,
+    _provider_input_hash,
+    _study_provider_kinds,
+    baseline_bdqn_config,
     bdqn_hyperparameter_matrix,
     ensure_initial_checkpoint,
     generate_round1_scenarios,
     gp_discovery_matrix,
+    initialize_round1_study,
+    migration_path_jobs,
     provider_cross_matrix_jobs,
     train_bdqn_provider_cell,
 )
@@ -114,10 +126,212 @@ def test_cross_matrix_has_every_training_and_evaluation_provider():
         seeds=[1], checkpoint_by_training_provider=checkpoints
     )
 
-    assert len(jobs) == 9
+    assert len(jobs) == 16
     assert {
         (job["training_provider"], job["evaluation_provider"]) for job in jobs
     } == {(left, right) for left in PROVIDER_KINDS for right in PROVIDER_KINDS}
+
+
+def test_study_schema_controls_provider_membership():
+    assert _study_provider_kinds({"schema_version": 1}) == LEGACY_PROVIDER_KINDS
+    assert _study_provider_kinds(
+        {
+            "schema_version": ROUND1_MANIFEST_SCHEMA_VERSION,
+            "providers": list(PROVIDER_KINDS),
+        }
+    ) == PROVIDER_KINDS
+    try:
+        _study_provider_kinds(
+            {
+                "schema_version": ROUND1_MANIFEST_SCHEMA_VERSION,
+                "providers": ["fixed", "arch", "ss", "g0"],
+            }
+        )
+    except ValueError as error:
+        assert "provider order" in str(error)
+    else:
+        raise AssertionError("schema-v2 accepted a reordered provider list")
+
+
+def test_migration_paths_add_ss_self_and_g0_routes():
+    checkpoints = {
+        provider: {1: f"{provider}.pt"} for provider in PROVIDER_KINDS
+    }
+    jobs = migration_path_jobs(seeds=[1], t0_checkpoints=checkpoints)
+
+    assert {job["name"] for job in jobs} == {
+        "fixed_to_fixed",
+        "fixed_to_g0",
+        "ss_to_ss",
+        "ss_to_g0",
+        "arch_to_arch",
+        "arch_to_g0",
+        "g0_to_g0",
+    }
+
+
+def test_convergence_report_resolves_imported_v1_cells_from_t0_registry():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        external = root / "source-v1" / "fixed" / "seed_1"
+        external.mkdir(parents=True)
+        selection = root / "augmented-v2" / "bdqn" / "t0_selection.json"
+        selection.parent.mkdir(parents=True)
+        selection.write_text(
+            json.dumps(
+                {"cells": {"fixed": {"1": str(external.resolve())}}}
+            ),
+            encoding="utf-8",
+        )
+
+        resolved = _convergence_cell_directories(root / "augmented-v2")
+
+        assert resolved == {"fixed": [external.resolve()]}
+
+
+def test_completed_v1_convergence_can_be_imported_without_modifying_source():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        source_root = root / "source-v1"
+        source_root.mkdir()
+        architecture = source_root / "architecture.pt"
+        gp_policy = source_root / "gp_policy.json"
+        architecture.write_bytes(b"architecture")
+        gp_policy.write_text("{}", encoding="utf-8")
+        scenarios = generate_round1_scenarios(
+            source_root / "scenarios",
+            base_seed=77,
+            b_train_size=4,
+            b_validation_size=4,
+            g_train_size=4,
+            g_validation_size=4,
+            test_iid_size=4,
+            test_ood_size=4,
+        )
+        config = baseline_bdqn_config(seed=1, max_env_steps=1, device="cpu")
+        initial = ensure_initial_checkpoint(source_root, seed=1, config=config)
+        initial_hash = sha256_file(initial)
+        for provider in LEGACY_PROVIDER_KINDS:
+            cell_dir = source_root / "bdqn" / "convergence" / provider / "seed_1"
+            cell_dir.mkdir(parents=True)
+            cell = {
+                "schema_version": 1,
+                "status": "complete",
+                "provider": provider,
+                "seed": 1,
+                "checkpoint_steps": [0, 1],
+                "inputs": {
+                    "source_checkpoint": {
+                        "path": str(initial.resolve()),
+                        "sha256": initial_hash,
+                    },
+                    "provider_sha256": _provider_input_hash(
+                        provider,
+                        architecture_checkpoint=architecture,
+                        gp_policy=gp_policy,
+                    ),
+                    "train_manifest": {
+                        "path": str(Path(scenarios["b_train"]).resolve()),
+                        "sha256": sha256_file(scenarios["b_train"]),
+                    },
+                    "validation_manifest": {
+                        "path": str(Path(scenarios["b_validation"]).resolve()),
+                        "sha256": sha256_file(scenarios["b_validation"]),
+                    },
+                },
+                "checkpoints": {
+                    str(step): {"path": str(initial), "sha256": initial_hash}
+                    for step in (0, 1)
+                },
+            }
+            (cell_dir / "cell_manifest.json").write_text(
+                json.dumps(cell), encoding="utf-8"
+            )
+        source_manifest = source_root / "study_manifest.json"
+        source_study = {
+            "schema_version": 1,
+            "output_dir": str(source_root.resolve()),
+            "base_seed": 77,
+            "device": "cpu",
+            "inputs": {
+                "architecture_checkpoint": {
+                    "path": str(architecture.resolve()),
+                    "sha256": sha256_file(architecture),
+                },
+                "g0_policy": {
+                    "path": str(gp_policy.resolve()),
+                    "sha256": sha256_file(gp_policy),
+                },
+            },
+            "scenarios": {
+                name: str(Path(path).resolve())
+                for name, path in scenarios.items()
+                if name != "registry"
+            },
+            "scenario_registry": str(Path(scenarios["registry"]).resolve()),
+            "seeds": [1],
+            "discovery_seeds": [1],
+            "confirmation_seeds": [1],
+            "convergence_steps": [0, 1],
+            "transfer_steps": [0, 1],
+            "hyperparameter_matrix": bdqn_hyperparameter_matrix(),
+            "gp_discovery_matrix": gp_discovery_matrix(),
+            "test_locked": True,
+            "stages": {
+                "preflight": {"status": "complete"},
+                "bdqn_convergence": {"status": "complete"},
+            },
+        }
+        source_manifest.write_text(json.dumps(source_study), encoding="utf-8")
+        source_hash = sha256_file(source_manifest)
+
+        destination_manifest = initialize_round1_study(
+            output_dir=root / "augmented-v2",
+            augment_from=source_manifest,
+            device="auto",
+        )
+        augmented = json.loads(destination_manifest.read_text(encoding="utf-8"))
+
+        assert sha256_file(source_manifest) == source_hash
+        assert augmented["schema_version"] == ROUND1_MANIFEST_SCHEMA_VERSION
+        assert tuple(augmented["providers"]) == PROVIDER_KINDS
+        assert augmented["ss_config_sha256"] == _provider_input_hash(
+            "ss",
+            architecture_checkpoint=None,
+            gp_policy=None,
+        )
+        assert set(augmented["imported_convergence_cells"]) == set(
+            LEGACY_PROVIDER_KINDS
+        )
+        assert augmented["shared_initial_checkpoints"]["1"]["sha256"] == initial_hash
+        assert augmented["stages"]["preflight"]["status"] == "complete"
+
+        try:
+            initialize_round1_study(
+                output_dir=root / "augmented-v2",
+                augment_from=source_manifest,
+                ss_config=HystereticCapacityConfig(
+                    lower_threshold=0.35,
+                    upper_threshold=0.90,
+                ),
+            )
+        except ValueError as error:
+            assert "configuration changed" in str(error)
+        else:
+            raise AssertionError("resuming v2 accepted changed S/s-HCM thresholds")
+
+        tampered = dict(augmented)
+        tampered["ss_config"] = {
+            **tampered["ss_config"],
+            "lower_threshold": 0.35,
+        }
+        destination_manifest.write_text(json.dumps(tampered), encoding="utf-8")
+        try:
+            _load_study(destination_manifest)
+        except ValueError as error:
+            assert "configuration hash changed" in str(error)
+        else:
+            raise AssertionError("loading v2 accepted a tampered S/s-HCM config")
 
 
 def test_fixed_provider_cell_uses_shared_initial_checkpoint_and_validates():
@@ -149,6 +363,37 @@ def test_fixed_provider_cell_uses_shared_initial_checkpoint_and_validates():
         assert Path(outputs["manifest"]).is_file()
         assert Path(outputs["summary"]).is_file()
         assert "fixed_3_1" in Path(outputs["summary"]).read_text(encoding="utf-8")
+
+
+def test_ss_provider_cell_uses_the_shared_initial_checkpoint_and_validates():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        train = tiny_manifest(root / "train.json", "b_train")
+        validation = tiny_manifest(root / "validation.json", "b_validation")
+        config = BranchingDQNConfig(
+            episodes=10,
+            max_env_steps=1,
+            scenario_pool_size=4,
+            batch_size=2,
+            buffer_size=10,
+            min_buffer_size=10,
+            seed=3,
+            device="cpu",
+        )
+        initial = ensure_initial_checkpoint(root, seed=3, config=config)
+        outputs = train_bdqn_provider_cell(
+            output_dir=root / "cell",
+            provider_kind="ss",
+            source_checkpoint=initial,
+            train_manifest=train,
+            validation_manifest=validation,
+            config=config,
+            checkpoint_steps=(0, 1),
+        )
+
+        assert Path(outputs["manifest"]).is_file()
+        assert Path(outputs["summary"]).is_file()
+        assert "ss_3_1" in Path(outputs["summary"]).read_text(encoding="utf-8")
 
 
 def test_interrupted_cell_resume_matches_continuous_training():

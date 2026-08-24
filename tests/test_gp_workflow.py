@@ -35,6 +35,11 @@ def one_operation_mission(func_type):
 class GPWorkflowTest(unittest.TestCase):
     def make_tiny_manifest(self, directory: Path, split: str, seed: int):
         func_type = int(env.FULL_SOS[0].func_type)
+        static_system = next(
+            system
+            for system in env.FULL_SOS[1:]
+            if int(system.func_type) == func_type
+        )
         mission = one_operation_mission(func_type)
         scenarios = [
             evaluation.scenario_payload(
@@ -45,6 +50,7 @@ class GPWorkflowTest(unittest.TestCase):
                 budget=8000.0,
                 refund_rate=0.8,
                 split=split,
+                static_feasible_architecture=(static_system,),
             )
             for index, category in enumerate(SCENARIO_CATEGORIES)
         ]
@@ -179,7 +185,7 @@ class GPWorkflowTest(unittest.TestCase):
                 scheduler_checkpoint=checkpoint,
                 scenario_manifest=scenario_dir / "test_iid.json",
                 output_dir=root / "evaluation",
-                baselines=("fixed", "gp"),
+                baselines=("fixed", "ss", "gp"),
                 device="cpu",
             )
 
@@ -197,8 +203,29 @@ class GPWorkflowTest(unittest.TestCase):
             self.assertTrue(all(path.exists() for path in evaluation_outputs.values()))
             with evaluation_outputs["results"].open(encoding="utf-8-sig") as file:
                 rows = list(csv.DictReader(file))
-            self.assertEqual(len(rows), 8)
-            self.assertEqual({row["model"] for row in rows}, {"fixed", "gp"})
+            self.assertEqual(len(rows), 12)
+            self.assertEqual({row["model"] for row in rows}, {"fixed", "ss", "gp"})
+            self.assertIn("ss_emergency_count", rows[0])
+            self.assertIn("ss_replace_dominates_add_count", rows[0])
+            self.assertIn("ss_net_cost_delta_total", rows[0])
+            scenarios = {
+                item["scenario_hash"]: item
+                for item in load_scenario_manifest(
+                    scenario_dir / "test_iid.json"
+                )["scenarios"]
+            }
+            for row in rows:
+                scenario = scenarios[row["scenario_hash"]]
+                indices_key = (
+                    "static_feasible_system_indices"
+                    if row["model"] == "fixed"
+                    else "architecture_system_indices"
+                )
+                expected_cost = sum(
+                    env.FULL_SOS[int(index)].cost
+                    for index in scenario[indices_key]
+                )
+                self.assertEqual(float(row["initial_net_cost"]), expected_cost)
 
 
 if __name__ == "__main__":

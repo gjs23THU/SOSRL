@@ -19,6 +19,10 @@ import torch
 
 from .. import domain as syn
 from .. import environment as env
+from ..baselines.hysteretic_capacity import (
+    HystereticCapacityConfig,
+    HystereticCapacityProvider,
+)
 from ..gp.artifact import (
     create_policy_artifact,
     load_gp_policy,
@@ -1042,7 +1046,10 @@ def _evaluate_provider_records(
     rows = []
     schedules = []
     for episode, scenario in enumerate(scenarios):
-        architecture, mission = evaluation.scenario_from_payload(scenario)
+        if model == "fixed":
+            architecture, mission = evaluation.static_scenario_from_payload(scenario)
+        else:
+            architecture, mission = evaluation.scenario_from_payload(scenario)
         mission_env = env.MissionEnv(
             architecture,
             mission,
@@ -1183,8 +1190,9 @@ def evaluate_gp_stack(
     scheduler_checkpoint: str | Path,
     scenario_manifest: str | Path,
     output_dir: str | Path,
-    baselines: Sequence[str] = ("fixed", "random_concrete", "gp"),
+    baselines: Sequence[str] = ("fixed", "ss", "random_concrete", "gp"),
     manual_architecture_checkpoint: str | Path | None = None,
+    ss_config: HystereticCapacityConfig | None = None,
     device: str = "cpu",
     collect_schedule: bool = False,
 ) -> dict[str, Path]:
@@ -1202,6 +1210,8 @@ def evaluate_gp_stack(
     providers = {}
     if "fixed" in baselines:
         providers["fixed"] = FixedArchitectureProvider()
+    if "ss" in baselines:
+        providers["ss"] = HystereticCapacityProvider(ss_config)
     if "random_concrete" in baselines:
         providers["random_concrete"] = RandomConcreteArchitectureProvider(seed=20260820)
     if "gp" in baselines:

@@ -800,6 +800,7 @@ while mission 未完成：
 | HRL                       | 两个训练后的 DQN                          |
 | Static Initial            | 初始 architecture 固定，只运行 Scheduler  |
 | Fixed Architecture Rules  | 能 KEEP 就 KEEP，否则选编号最小的救援规则 |
+| S/s-HCM                   | 按能力剩余需求/容量压力，以 0.40/0.90 迟滞阈值执行 ADD/DEL，REPLACE 仅作同能力层级补充 |
 | Random Architecture Rules | 在有效架构规则中随机选择                  |
 | Full System Reference     | 激活完整候选池后运行 Scheduler            |
 | Flat Rule DQN             | 单网络从 6×4 个联合规则动作中选择         |

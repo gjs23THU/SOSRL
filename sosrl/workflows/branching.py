@@ -7,6 +7,7 @@ from time import perf_counter
 import numpy as np
 import torch
 
+from .. import domain as syn
 from .. import environment as env
 from ..rl.branching import (
     BranchingDQNAgent,
@@ -22,6 +23,20 @@ from ..gp.provider import (
 )
 from . import scheduler as dqn
 from .hierarchical import AdaptiveScenarioPool, scenario_hash, scheduler_reward
+
+
+SS_TRIGGER_NAMES = ("emergency", "expand", "contract", "band_keep")
+SS_REPLACE_REASON_NAMES = (
+    "primary_add",
+    "no_add",
+    "dominates_add",
+    "safe_delete",
+    "delete_unsafe",
+    "no_feasible_expansion",
+    "no_safe_contraction",
+    "not_applicable",
+    "no_rescue",
+)
 
 
 def freeze_architecture_provider(architecture_agent) -> None:
@@ -118,6 +133,14 @@ def run_branching_episode(
     architecture_candidate_total = 0
     architecture_candidate_max = 0
     scheduler_decisions = 0
+    ss_trigger_counts = {name: 0 for name in SS_TRIGGER_NAMES}
+    ss_replace_reason_counts = {name: 0 for name in SS_REPLACE_REASON_NAMES}
+    ss_target_capability_counts = np.zeros(
+        len(syn.func_type2idx), dtype=np.int32
+    )
+    ss_capacity_delta_total = 0.0
+    ss_net_cost_delta_total = 0.0
+    ss_diagnostics_observed = False
     info = {"success": False, "dead_end": False}
 
     for _ in range(mission_env.T * mission_env.O + mission_env.N):
@@ -133,6 +156,24 @@ def run_branching_episode(
         architecture_candidate_max = max(
             architecture_candidate_max, int(decision.candidate_count)
         )
+        trigger = decision.diagnostics.get("trigger")
+        if trigger in ss_trigger_counts:
+            ss_diagnostics_observed = True
+            ss_trigger_counts[str(trigger)] += 1
+            replace_reason = decision.diagnostics.get("replace_reason")
+            if replace_reason in ss_replace_reason_counts:
+                ss_replace_reason_counts[str(replace_reason)] += 1
+            target_capability = int(
+                decision.diagnostics.get("target_capability", -1)
+            )
+            if 0 <= target_capability < len(ss_target_capability_counts):
+                ss_target_capability_counts[target_capability] += 1
+            ss_capacity_delta_total += float(
+                decision.diagnostics.get("capacity_delta", 0.0)
+            )
+            ss_net_cost_delta_total += float(
+                decision.diagnostics.get("net_cost_delta", 0.0)
+            )
         if not decision.valid:
             info = {"success": False, "dead_end": True}
             if pending_scheduler is not None:
@@ -305,6 +346,12 @@ def run_branching_episode(
         "architecture_candidate_total": int(architecture_candidate_total),
         "architecture_candidate_max": int(architecture_candidate_max),
         "scheduler_decisions": int(scheduler_decisions),
+        "ss_trigger_counts": ss_trigger_counts,
+        "ss_replace_reason_counts": ss_replace_reason_counts,
+        "ss_target_capability_counts": ss_target_capability_counts,
+        "ss_capacity_delta_total": float(ss_capacity_delta_total),
+        "ss_net_cost_delta_total": float(ss_net_cost_delta_total),
+        "ss_diagnostics_observed": bool(ss_diagnostics_observed),
         "inference_measured": bool(measure_inference),
     }
 
@@ -375,6 +422,19 @@ def branching_episode_row(
     row["max_architecture_candidate_count"] = int(
         result["architecture_candidate_max"]
     )
+    if result["ss_diagnostics_observed"]:
+        for name in SS_TRIGGER_NAMES:
+            row[f"ss_{name}_count"] = int(result["ss_trigger_counts"][name])
+        for name in SS_REPLACE_REASON_NAMES:
+            row[f"ss_replace_{name}_count"] = int(
+                result["ss_replace_reason_counts"][name]
+            )
+        for func_type in sorted(syn.func_type2idx.values()):
+            row[f"ss_target_capability_{func_type}_count"] = int(
+                result["ss_target_capability_counts"][int(func_type)]
+            )
+        row["ss_capacity_delta_total"] = float(result["ss_capacity_delta_total"])
+        row["ss_net_cost_delta_total"] = float(result["ss_net_cost_delta_total"])
     for sys_idx in range(mission_env.N):
         row[f"system_{sys_idx}_added_count"] = int(
             result["architecture_add_system_counts"][sys_idx]

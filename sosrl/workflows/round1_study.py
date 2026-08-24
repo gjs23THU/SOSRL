@@ -24,6 +24,10 @@ import numpy as np
 import torch
 
 from .. import environment as env
+from ..baselines.hysteretic_capacity import (
+    HystereticCapacityConfig,
+    HystereticCapacityProvider,
+)
 from ..gp.artifact import load_gp_policy, sha256_file
 from ..gp.evolution import EpisodeOutcome, episode_objective
 from ..gp.provider import (
@@ -52,7 +56,9 @@ from .scheduler import ScenarioPool, set_seed
 
 
 ROUND1_STUDY_SCHEMA_VERSION = 1
-PROVIDER_KINDS = ("fixed", "arch", "g0")
+ROUND1_MANIFEST_SCHEMA_VERSION = 2
+LEGACY_PROVIDER_KINDS = ("fixed", "arch", "g0")
+PROVIDER_KINDS = ("fixed", "ss", "arch", "g0")
 DEFAULT_CONVERGENCE_STEPS = (0, 20000, 40000, 60000, 80000, 120000, 160000, 200000)
 DEFAULT_TRANSFER_STEPS = (0, 10000, 20000, 30000, 40000, 60000, 80000)
 
@@ -345,9 +351,12 @@ def _provider_input_hash(
     *,
     architecture_checkpoint: str | Path | None,
     gp_policy: str | Path | None,
+    ss_config: HystereticCapacityConfig | None = None,
 ) -> str:
     if provider_kind == "fixed":
         return "static-feasible-keep-v1"
+    if provider_kind == "ss":
+        return _json_sha256((ss_config or HystereticCapacityConfig()).to_dict())
     path = architecture_checkpoint if provider_kind == "arch" else gp_policy
     if path is None:
         raise ValueError(f"{provider_kind} provider input is required.")
@@ -360,11 +369,14 @@ def load_round1_provider(
     architecture_checkpoint: str | Path | None,
     gp_policy: str | Path | None,
     device: str,
+    ss_config: HystereticCapacityConfig | None = None,
 ):
     if provider_kind not in PROVIDER_KINDS:
         raise ValueError(f"unknown provider kind: {provider_kind!r}")
     if provider_kind == "fixed":
         return FixedArchitectureProvider()
+    if provider_kind == "ss":
+        return HystereticCapacityProvider(ss_config)
     if provider_kind == "arch":
         if architecture_checkpoint is None:
             raise ValueError("architecture checkpoint is required for provider 'arch'.")
@@ -420,6 +432,7 @@ def evaluate_bdqn_provider_cell(
     architecture_checkpoint: str | Path | None,
     gp_policy: str | Path | None,
     device: str,
+    ss_config: HystereticCapacityConfig | None = None,
 ) -> list[dict[str, Any]]:
     agent, _ = load_branching_checkpoint(
         scheduler_checkpoint,
@@ -435,6 +448,7 @@ def evaluate_bdqn_provider_cell(
         architecture_checkpoint=architecture_checkpoint,
         gp_policy=gp_policy,
         device=device,
+        ss_config=ss_config,
     )
     with torch.no_grad():
         for episode, payload in enumerate(scenarios):
@@ -578,6 +592,7 @@ def train_bdqn_provider_cell(
     checkpoint_steps: Sequence[int],
     architecture_checkpoint: str | Path | None = None,
     gp_policy: str | Path | None = None,
+    ss_config: HystereticCapacityConfig | None = None,
     stop_after_checkpoint: int | None = None,
 ) -> dict[str, Path]:
     """Train and validate one controlled provider/seed/checkpoint cell."""
@@ -605,7 +620,29 @@ def train_bdqn_provider_cell(
         provider_kind,
         architecture_checkpoint=architecture_checkpoint,
         gp_policy=gp_policy,
+        ss_config=ss_config,
     )
+    cell_inputs = {
+        "source_checkpoint": {
+            "path": str(Path(source_checkpoint).resolve()),
+            "sha256": sha256_file(Path(source_checkpoint).resolve()),
+        },
+        "provider_sha256": input_hash,
+        "train_manifest": {
+            "path": str(Path(train_manifest).resolve()),
+            "sha256": sha256_file(Path(train_manifest).resolve()),
+            "manifest_hash": train["manifest_hash"],
+        },
+        "validation_manifest": {
+            "path": str(Path(validation_manifest).resolve()),
+            "sha256": sha256_file(Path(validation_manifest).resolve()),
+            "manifest_hash": validation["manifest_hash"],
+        },
+    }
+    if provider_kind == "ss":
+        cell_inputs["ss_config"] = (
+            ss_config or HystereticCapacityConfig()
+        ).to_dict()
     cell_manifest = {
         "schema_version": ROUND1_STUDY_SCHEMA_VERSION,
         "status": "running",
@@ -614,23 +651,7 @@ def train_bdqn_provider_cell(
         "seed": int(config.seed),
         "config": asdict(config),
         "checkpoint_steps": list(steps),
-        "inputs": {
-            "source_checkpoint": {
-                "path": str(Path(source_checkpoint).resolve()),
-                "sha256": sha256_file(Path(source_checkpoint).resolve()),
-            },
-            "provider_sha256": input_hash,
-            "train_manifest": {
-                "path": str(Path(train_manifest).resolve()),
-                "sha256": sha256_file(Path(train_manifest).resolve()),
-                "manifest_hash": train["manifest_hash"],
-            },
-            "validation_manifest": {
-                "path": str(Path(validation_manifest).resolve()),
-                "sha256": sha256_file(Path(validation_manifest).resolve()),
-                "manifest_hash": validation["manifest_hash"],
-            },
-        },
+        "inputs": cell_inputs,
     }
     if resuming:
         immutable_fields = ("provider", "seed", "config", "checkpoint_steps", "inputs")
@@ -661,6 +682,7 @@ def train_bdqn_provider_cell(
         architecture_checkpoint=architecture_checkpoint,
         gp_policy=gp_policy,
         device=config.device,
+        ss_config=ss_config,
     )
     sampler = StratifiedManifestSampler(train["scenarios"], seed=int(config.seed))
     checkpoints_dir = destination / "checkpoints"
@@ -805,6 +827,7 @@ def train_bdqn_provider_cell(
         provider_kind,
         architecture_checkpoint=architecture_checkpoint,
         gp_policy=gp_policy,
+        ss_config=ss_config,
     ) != input_hash:
         raise RuntimeError("frozen provider input changed during training.")
 
@@ -821,6 +844,7 @@ def train_bdqn_provider_cell(
             architecture_checkpoint=architecture_checkpoint,
             gp_policy=gp_policy,
             device=config.device,
+            ss_config=ss_config,
         )
         for row in rows:
             row.update(
@@ -982,12 +1006,13 @@ def provider_cross_matrix_jobs(
     *,
     seeds: Sequence[int],
     checkpoint_by_training_provider: dict[str, dict[int, str | Path]],
+    provider_kinds: Sequence[str] = PROVIDER_KINDS,
 ) -> list[dict[str, Any]]:
     jobs: list[dict[str, Any]] = []
     for seed in seeds:
-        for training_provider in PROVIDER_KINDS:
+        for training_provider in provider_kinds:
             checkpoint = checkpoint_by_training_provider[training_provider][int(seed)]
-            for evaluation_provider in PROVIDER_KINDS:
+            for evaluation_provider in provider_kinds:
                 jobs.append(
                     {
                         "seed": int(seed),
@@ -1072,7 +1097,7 @@ def common_convergence_step(
 
     provider_steps: dict[str, int] = {}
     seed_details: dict[str, dict[str, int | None]] = {}
-    for provider in PROVIDER_KINDS:
+    for provider in cell_directories:
         observed: list[int] = []
         final_steps: list[int] = []
         seed_details[provider] = {}
@@ -1120,6 +1145,8 @@ def evaluate_provider_cross_matrix(
     architecture_checkpoint: str | Path,
     gp_policy: str | Path,
     device: str,
+    ss_config: HystereticCapacityConfig | None = None,
+    provider_kinds: Sequence[str] = PROVIDER_KINDS,
 ) -> dict[str, Path]:
     """Evaluate the full train-provider by test-provider matrix."""
 
@@ -1170,6 +1197,7 @@ def evaluate_provider_cross_matrix(
             architecture_checkpoint=architecture_checkpoint,
             gp_policy=gp_policy,
             device=device,
+            ss_config=ss_config,
         )
         for row in rows:
             row.update(
@@ -1202,7 +1230,7 @@ def evaluate_provider_cross_matrix(
             "job_count": len(jobs),
             "job_signature_sha256": job_signature,
             "result_rows": len(all_rows),
-            "providers": list(PROVIDER_KINDS),
+            "providers": list(provider_kinds),
         },
     )
     return {
@@ -1217,13 +1245,15 @@ def migration_path_jobs(
     seeds: Sequence[int],
     t0_checkpoints: dict[str, dict[int, str | Path]],
 ) -> list[dict[str, Any]]:
-    paths = (
+    paths = [
         ("fixed", "fixed"),
         ("fixed", "g0"),
         ("arch", "arch"),
         ("arch", "g0"),
         ("g0", "g0"),
-    )
+    ]
+    if "ss" in t0_checkpoints:
+        paths[2:2] = [("ss", "ss"), ("ss", "g0")]
     return [
         {
             "name": f"{source}_to_{target}",
@@ -1812,53 +1842,242 @@ def select_final_bdqn_confirmation(
     return selection
 
 
+def _collect_imported_convergence(
+    source_manifest: Path,
+    source_study: dict[str, Any],
+) -> tuple[dict[str, dict[str, dict[str, str]]], dict[str, dict[str, str]]]:
+    """Validate completed legacy cells and return immutable import records."""
+
+    if _study_provider_kinds(source_study) != LEGACY_PROVIDER_KINDS:
+        raise ValueError("round-one augmentation requires a legacy three-provider study.")
+    if source_study.get("stages", {}).get("preflight", {}).get("status") != "complete":
+        raise ValueError("source round-one preflight is not complete.")
+    if (
+        source_study.get("stages", {})
+        .get("bdqn_convergence", {})
+        .get("status")
+        != "complete"
+    ):
+        raise ValueError("source round-one convergence is not complete.")
+    if not bool(source_study.get("test_locked", False)):
+        raise ValueError("cannot augment a study after Test-v2 was consumed.")
+
+    source_root = Path(source_study["output_dir"])
+    expected_steps = {int(step) for step in source_study["convergence_steps"]}
+    expected_train_hash = sha256_file(source_study["scenarios"]["b_train"])
+    expected_validation_hash = sha256_file(
+        source_study["scenarios"]["b_validation"]
+    )
+    imported: dict[str, dict[str, dict[str, str]]] = {
+        provider: {} for provider in LEGACY_PROVIDER_KINDS
+    }
+    shared: dict[str, dict[str, str]] = {}
+    for seed in source_study["seeds"]:
+        source_hashes: set[str] = set()
+        source_paths: set[str] = set()
+        for provider in LEGACY_PROVIDER_KINDS:
+            cell_dir = (
+                source_root
+                / "bdqn"
+                / "convergence"
+                / provider
+                / f"seed_{int(seed)}"
+            )
+            cell_manifest = cell_dir / "cell_manifest.json"
+            if not cell_manifest.is_file():
+                raise FileNotFoundError(f"missing imported cell manifest: {cell_manifest}")
+            cell = json.loads(cell_manifest.read_text(encoding="utf-8"))
+            if cell.get("status") != "complete":
+                raise ValueError(f"imported cell is not complete: {cell_dir}")
+            if str(cell.get("provider")) != provider or int(cell.get("seed", -1)) != int(seed):
+                raise ValueError(f"imported cell identity mismatch: {cell_dir}")
+            if {int(step) for step in cell.get("checkpoints", {})} != expected_steps:
+                raise ValueError(f"imported cell checkpoint grid mismatch: {cell_dir}")
+            inputs = cell.get("inputs", {})
+            if inputs.get("train_manifest", {}).get("sha256") != expected_train_hash:
+                raise ValueError(f"imported cell training manifest mismatch: {cell_dir}")
+            if (
+                inputs.get("validation_manifest", {}).get("sha256")
+                != expected_validation_hash
+            ):
+                raise ValueError(f"imported cell validation manifest mismatch: {cell_dir}")
+            expected_provider_hash = _provider_input_hash(
+                provider,
+                architecture_checkpoint=source_study["inputs"]["architecture_checkpoint"][
+                    "path"
+                ],
+                gp_policy=source_study["inputs"]["g0_policy"]["path"],
+            )
+            if inputs.get("provider_sha256") != expected_provider_hash:
+                raise ValueError(f"imported provider input mismatch: {cell_dir}")
+            source_record = inputs.get("source_checkpoint", {})
+            source_path = Path(source_record.get("path", ""))
+            if not source_path.is_file() or sha256_file(source_path) != source_record.get(
+                "sha256"
+            ):
+                raise ValueError(f"imported source checkpoint mismatch: {cell_dir}")
+            source_hashes.add(str(source_record["sha256"]))
+            source_paths.add(str(source_path.resolve()))
+            for record in cell["checkpoints"].values():
+                if sha256_file(record["path"]) != record["sha256"]:
+                    raise ValueError(f"imported checkpoint hash mismatch: {record['path']}")
+            imported[provider][str(int(seed))] = {
+                "path": str(cell_dir.resolve()),
+                "manifest_sha256": sha256_file(cell_manifest),
+            }
+        if len(source_hashes) != 1 or len(source_paths) != 1:
+            raise ValueError(
+                f"legacy providers did not share one initial checkpoint for seed {seed}."
+            )
+        shared[str(int(seed))] = {
+            "path": next(iter(source_paths)),
+            "sha256": next(iter(source_hashes)),
+        }
+    return imported, shared
+
+
+def _study_initial_checkpoint(
+    study: dict[str, Any],
+    root: Path,
+    *,
+    seed: int,
+    config: BranchingDQNConfig,
+) -> Path:
+    imported = study.get("shared_initial_checkpoints", {}).get(str(int(seed)))
+    if imported is None:
+        return ensure_initial_checkpoint(root, seed=int(seed), config=config)
+    path = Path(imported["path"])
+    if sha256_file(path) != imported["sha256"]:
+        raise ValueError(f"imported initial checkpoint changed for seed {seed}.")
+    agent, checkpoint = load_branching_checkpoint(
+        path, device=config.device, load_optimizer=False
+    )
+    if asdict(agent.config) != asdict(config):
+        raise ValueError(f"imported initial checkpoint configuration mismatch for seed {seed}.")
+    if int(checkpoint.get("training_state", {}).get("seed", -1)) != int(seed):
+        raise ValueError(f"imported initial checkpoint seed mismatch for seed {seed}.")
+    return path
+
+
 def initialize_round1_study(
     *,
     output_dir: str | Path,
-    architecture_checkpoint: str | Path,
-    gp_policy: str | Path,
+    architecture_checkpoint: str | Path | None = None,
+    gp_policy: str | Path | None = None,
     base_seed: int = 20260824,
     device: str = "auto",
     scenario_sizes: dict[str, int] | None = None,
+    ss_config: HystereticCapacityConfig | None = None,
+    augment_from: str | Path | None = None,
 ) -> Path:
     """Create the immutable inputs and preregistered matrices for the study."""
 
     destination = Path(output_dir).resolve()
     manifest_path = destination / "study_manifest.json"
+    source_manifest: Path | None = None
+    source_study: dict[str, Any] | None = None
+    if augment_from is not None:
+        source_manifest, source_study = _load_study(augment_from)
+        if destination == Path(source_study["output_dir"]).resolve():
+            raise ValueError("augmented round-one study must use a new output directory.")
+        if architecture_checkpoint is None:
+            architecture_checkpoint = source_study["inputs"]["architecture_checkpoint"][
+                "path"
+            ]
+        if gp_policy is None:
+            gp_policy = source_study["inputs"]["g0_policy"]["path"]
+    if architecture_checkpoint is None or gp_policy is None:
+        raise ValueError(
+            "architecture_checkpoint and gp_policy are required without --augment-from."
+        )
     architecture_path = Path(architecture_checkpoint).resolve()
     gp_path = Path(gp_policy).resolve()
+    resolved_ss_config = ss_config or HystereticCapacityConfig()
     if manifest_path.is_file():
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        _, manifest = _load_study(manifest_path)
         inputs = manifest["inputs"]
         if inputs["architecture_checkpoint"]["sha256"] != sha256_file(architecture_path):
             raise ValueError("round-one Architecture DQN input hash changed.")
         if inputs["g0_policy"]["sha256"] != sha256_file(gp_path):
             raise ValueError("round-one G0 input hash changed.")
+        if int(manifest.get("schema_version", 1)) >= ROUND1_MANIFEST_SCHEMA_VERSION:
+            if manifest.get("ss_config") != resolved_ss_config.to_dict():
+                raise ValueError("round-one S/s-HCM configuration changed.")
         if manifest.get("stages", {}).get("preflight", {}).get("status") != "complete":
             preflight_round1_study(manifest_path)
         return manifest_path
     destination.mkdir(parents=True, exist_ok=True)
-    sizes = {
-        "b_train_size": 256,
-        "b_validation_size": 256,
-        "g_train_size": 256,
-        "g_validation_size": 256,
-        "test_iid_size": 1000,
-        "test_ood_size": 500,
-        **(scenario_sizes or {}),
-    }
-    scenario_paths = generate_round1_scenarios(
-        destination / "scenarios",
-        base_seed=int(base_seed),
-        **sizes,
-    )
+    imported_cells = None
+    shared_initial_checkpoints = None
+    imported_from = None
+    if source_study is None:
+        sizes = {
+            "b_train_size": 256,
+            "b_validation_size": 256,
+            "g_train_size": 256,
+            "g_validation_size": 256,
+            "test_iid_size": 1000,
+            "test_ood_size": 500,
+            **(scenario_sizes or {}),
+        }
+        scenario_paths = generate_round1_scenarios(
+            destination / "scenarios",
+            base_seed=int(base_seed),
+            **sizes,
+        )
+        resolved_base_seed = int(base_seed)
+        resolved_device = default_device() if device == "auto" else str(device)
+        seeds = list(range(1, 9))
+        discovery_seeds = [1, 2, 3]
+        confirmation_seeds = [4, 5, 6, 7, 8]
+        convergence_steps = list(DEFAULT_CONVERGENCE_STEPS)
+        transfer_steps = list(DEFAULT_TRANSFER_STEPS)
+        hyperparameter_matrix = bdqn_hyperparameter_matrix()
+        discovery_matrix = gp_discovery_matrix()
+    else:
+        imported_cells, shared_initial_checkpoints = _collect_imported_convergence(
+            source_manifest,
+            source_study,
+        )
+        if architecture_path != Path(
+            source_study["inputs"]["architecture_checkpoint"]["path"]
+        ).resolve() or gp_path != Path(
+            source_study["inputs"]["g0_policy"]["path"]
+        ).resolve():
+            raise ValueError("augmented study inputs must match the source study.")
+        resolved_device = str(source_study["device"])
+        if device != "auto" and str(device) != resolved_device:
+            raise ValueError("augmented study device must match the source study.")
+        scenario_paths = {
+            **{
+                name: Path(path)
+                for name, path in source_study["scenarios"].items()
+            },
+            "registry": Path(source_study["scenario_registry"]),
+        }
+        resolved_base_seed = int(source_study["base_seed"])
+        seeds = list(source_study["seeds"])
+        discovery_seeds = list(source_study["discovery_seeds"])
+        confirmation_seeds = list(source_study["confirmation_seeds"])
+        convergence_steps = list(source_study["convergence_steps"])
+        transfer_steps = list(source_study["transfer_steps"])
+        hyperparameter_matrix = list(source_study["hyperparameter_matrix"])
+        discovery_matrix = list(source_study["gp_discovery_matrix"])
+        imported_from = {
+            "study_manifest": str(source_manifest),
+            "study_manifest_sha256_at_import": sha256_file(source_manifest),
+            "schema_version": int(source_study["schema_version"]),
+        }
     manifest = {
-        "schema_version": ROUND1_STUDY_SCHEMA_VERSION,
+        "schema_version": ROUND1_MANIFEST_SCHEMA_VERSION,
         "created_at": _utc_now(),
         "code_commit": _current_git_commit(),
         "output_dir": str(destination),
-        "base_seed": int(base_seed),
-        "device": default_device() if device == "auto" else str(device),
+        "base_seed": resolved_base_seed,
+        "device": resolved_device,
+        "providers": list(PROVIDER_KINDS),
+        "ss_config": resolved_ss_config.to_dict(),
+        "ss_config_sha256": _json_sha256(resolved_ss_config.to_dict()),
         "inputs": {
             "architecture_checkpoint": {
                 "path": str(architecture_path),
@@ -1872,23 +2091,29 @@ def initialize_round1_study(
             if name != "registry"
         },
         "scenario_registry": str(scenario_paths["registry"]),
-        "seeds": list(range(1, 9)),
-        "discovery_seeds": [1, 2, 3],
-        "confirmation_seeds": [4, 5, 6, 7, 8],
-        "convergence_steps": list(DEFAULT_CONVERGENCE_STEPS),
-        "transfer_steps": list(DEFAULT_TRANSFER_STEPS),
+        "seeds": seeds,
+        "discovery_seeds": discovery_seeds,
+        "confirmation_seeds": confirmation_seeds,
+        "convergence_steps": convergence_steps,
+        "transfer_steps": transfer_steps,
         "migration_paths": [
             "fixed_to_fixed",
             "fixed_to_g0",
+            "ss_to_ss",
+            "ss_to_g0",
             "arch_to_arch",
             "arch_to_g0",
             "g0_to_g0",
         ],
-        "hyperparameter_matrix": bdqn_hyperparameter_matrix(),
-        "gp_discovery_matrix": gp_discovery_matrix(),
+        "hyperparameter_matrix": hyperparameter_matrix,
+        "gp_discovery_matrix": discovery_matrix,
         "test_locked": True,
         "stages": {},
     }
+    if imported_from is not None:
+        manifest["imported_from"] = imported_from
+        manifest["imported_convergence_cells"] = imported_cells
+        manifest["shared_initial_checkpoints"] = shared_initial_checkpoints
     _write_json(manifest_path, manifest)
     preflight_round1_study(manifest_path)
     return manifest_path
@@ -1897,13 +2122,49 @@ def initialize_round1_study(
 def _load_study(study_manifest: str | Path) -> tuple[Path, dict[str, Any]]:
     path = Path(study_manifest).resolve()
     study = json.loads(path.read_text(encoding="utf-8"))
-    if int(study.get("schema_version", -1)) != ROUND1_STUDY_SCHEMA_VERSION:
+    if int(study.get("schema_version", -1)) not in {
+        ROUND1_STUDY_SCHEMA_VERSION,
+        ROUND1_MANIFEST_SCHEMA_VERSION,
+    }:
         raise ValueError("unsupported round-one study schema.")
+    if int(study["schema_version"]) == ROUND1_MANIFEST_SCHEMA_VERSION:
+        ss_payload = study.get("ss_config")
+        if not isinstance(ss_payload, dict) or study.get(
+            "ss_config_sha256"
+        ) != _json_sha256(ss_payload):
+            raise ValueError("round-one S/s-HCM configuration hash changed.")
     for name in ("architecture_checkpoint", "g0_policy"):
         record = study["inputs"][name]
         if sha256_file(record["path"]) != record["sha256"]:
             raise ValueError(f"round-one input hash changed: {name}")
     return path, study
+
+
+def _study_provider_kinds(study: dict[str, Any]) -> tuple[str, ...]:
+    if int(study.get("schema_version", 1)) == ROUND1_STUDY_SCHEMA_VERSION:
+        providers = tuple(study.get("providers", LEGACY_PROVIDER_KINDS))
+    else:
+        providers = tuple(study.get("providers", PROVIDER_KINDS))
+    if not providers or len(set(providers)) != len(providers):
+        raise ValueError("round-one provider list must be non-empty and unique.")
+    unknown = set(providers) - set(PROVIDER_KINDS)
+    if unknown:
+        raise ValueError(f"unknown round-one providers: {sorted(unknown)}")
+    if (
+        int(study.get("schema_version", 1)) == ROUND1_MANIFEST_SCHEMA_VERSION
+        and providers != PROVIDER_KINDS
+    ):
+        raise ValueError(
+            "schema-v2 provider order must be fixed, ss, arch, g0."
+        )
+    return providers
+
+
+def _study_ss_config(study: dict[str, Any]) -> HystereticCapacityConfig:
+    payload = study.get("ss_config")
+    if payload is None:
+        return HystereticCapacityConfig()
+    return HystereticCapacityConfig(**payload)
 
 
 def _mark_stage(
@@ -1925,16 +2186,40 @@ def run_round1_convergence_stage(study_manifest: str | Path) -> dict[str, Any]:
     manifest_path, study = _load_study(study_manifest)
     _require_complete_stage(study, "preflight")
     root = Path(study["output_dir"])
+    providers = _study_provider_kinds(study)
+    ss_config = _study_ss_config(study)
     _mark_stage(manifest_path, study, "bdqn_convergence", "running")
-    cells: dict[str, dict[int, str]] = {provider: {} for provider in PROVIDER_KINDS}
+    cells: dict[str, dict[int, str]] = {provider: {} for provider in providers}
+    imported_cells = study.get("imported_convergence_cells", {})
     for seed in study["seeds"]:
         config = baseline_bdqn_config(
             seed=int(seed),
             max_env_steps=max(study["convergence_steps"]),
             device=study["device"],
         )
-        initial = ensure_initial_checkpoint(root, seed=int(seed), config=config)
-        for provider in PROVIDER_KINDS:
+        initial = _study_initial_checkpoint(
+            study, root, seed=int(seed), config=config
+        )
+        for provider in providers:
+            imported = imported_cells.get(provider, {}).get(str(int(seed)))
+            if imported is not None:
+                imported_dir = Path(imported["path"])
+                imported_manifest = imported_dir / "cell_manifest.json"
+                if sha256_file(imported_manifest) != imported["manifest_sha256"]:
+                    raise ValueError(
+                        f"imported convergence cell changed: {imported_dir}"
+                    )
+                payload = json.loads(imported_manifest.read_text(encoding="utf-8"))
+                if (
+                    payload.get("status") != "complete"
+                    or payload.get("provider") != provider
+                    or int(payload.get("seed", -1)) != int(seed)
+                ):
+                    raise ValueError(
+                        f"imported convergence cell identity changed: {imported_dir}"
+                    )
+                cells[provider][int(seed)] = str(imported_dir)
+                continue
             cell_dir = root / "bdqn" / "convergence" / provider / f"seed_{int(seed)}"
             train_bdqn_provider_cell(
                 output_dir=cell_dir,
@@ -1946,6 +2231,7 @@ def run_round1_convergence_stage(study_manifest: str | Path) -> dict[str, Any]:
                 checkpoint_steps=study["convergence_steps"],
                 architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
                 gp_policy=study["inputs"]["g0_policy"]["path"],
+                ss_config=ss_config,
             )
             cells[provider][int(seed)] = str(cell_dir)
             if torch.cuda.is_available():
@@ -1958,8 +2244,15 @@ def run_round1_convergence_stage(study_manifest: str | Path) -> dict[str, Any]:
         }
         for provider, by_seed in cells.items()
     }
+    cell_map = {
+        provider: {str(seed): str(directory) for seed, directory in by_seed.items()}
+        for provider, by_seed in cells.items()
+    }
     selection_path = root / "bdqn" / "t0_selection.json"
-    _write_json(selection_path, {**t0, "checkpoints": checkpoint_map})
+    _write_json(
+        selection_path,
+        {**t0, "checkpoints": checkpoint_map, "cells": cell_map},
+    )
     _mark_stage(
         manifest_path,
         study,
@@ -1985,10 +2278,13 @@ def run_round1_cross_stage(study_manifest: str | Path) -> dict[str, Path]:
     manifest_path, study = _load_study(study_manifest)
     _require_complete_stage(study, "bdqn_convergence")
     root = Path(study["output_dir"])
+    providers = _study_provider_kinds(study)
+    ss_config = _study_ss_config(study)
     _, checkpoints = _t0_checkpoint_map(study)
     jobs = provider_cross_matrix_jobs(
         seeds=study["seeds"],
         checkpoint_by_training_provider=checkpoints,
+        provider_kinds=providers,
     )
     _mark_stage(manifest_path, study, "provider_cross", "running")
     outputs = evaluate_provider_cross_matrix(
@@ -1998,6 +2294,8 @@ def run_round1_cross_stage(study_manifest: str | Path) -> dict[str, Path]:
         architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
         gp_policy=study["inputs"]["g0_policy"]["path"],
         device=study["device"],
+        ss_config=ss_config,
+        provider_kinds=providers,
     )
     _mark_stage(
         manifest_path,
@@ -2034,6 +2332,7 @@ def run_round1_migration_stage(study_manifest: str | Path) -> dict[str, Any]:
     manifest_path, study = _load_study(study_manifest)
     _require_complete_stage(study, "bdqn_convergence")
     root = Path(study["output_dir"])
+    ss_config = _study_ss_config(study)
     _, checkpoints = _t0_checkpoint_map(study)
     jobs = migration_path_jobs(
         seeds=study["seeds"],
@@ -2062,6 +2361,7 @@ def run_round1_migration_stage(study_manifest: str | Path) -> dict[str, Any]:
             checkpoint_steps=study["transfer_steps"],
             architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
             gp_policy=study["inputs"]["g0_policy"]["path"],
+            ss_config=ss_config,
         )
         cells.setdefault(route, {})[seed] = str(cell_dir)
         if torch.cuda.is_available():
@@ -2080,6 +2380,7 @@ def run_round1_hyper_screen_stage(study_manifest: str | Path) -> dict[str, Any]:
     manifest_path, study = _load_study(study_manifest)
     _require_complete_stage(study, "bdqn_migration")
     root = Path(study["output_dir"])
+    ss_config = _study_ss_config(study)
     _, checkpoints = _t0_checkpoint_map(study)
     matrix = {row["name"]: row for row in study["hyperparameter_matrix"]}
     _mark_stage(manifest_path, study, "bdqn_hyper_screen", "running")
@@ -2119,6 +2420,7 @@ def run_round1_hyper_screen_stage(study_manifest: str | Path) -> dict[str, Any]:
                 checkpoint_steps=screen_steps,
                 architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
                 gp_policy=study["inputs"]["g0_policy"]["path"],
+                ss_config=ss_config,
             )
             cells_by_name[name].append(str(cell_dir))
             if torch.cuda.is_available():
@@ -2146,6 +2448,8 @@ def run_round1_hyper_confirm_stage(study_manifest: str | Path) -> dict[str, Any]
     manifest_path, study = _load_study(study_manifest)
     _require_complete_stage(study, "bdqn_hyper_screen")
     root = Path(study["output_dir"])
+    providers = _study_provider_kinds(study)
+    ss_config = _study_ss_config(study)
     _, checkpoints = _t0_checkpoint_map(study)
     selection = json.loads(
         (root / "bdqn" / "hyper_screen" / "selection.json").read_text(
@@ -2160,7 +2464,7 @@ def run_round1_hyper_confirm_stage(study_manifest: str | Path) -> dict[str, Any]
     _mark_stage(manifest_path, study, "bdqn_hyper_confirm", "running")
     cells: dict[str, dict[str, list[str]]] = {}
     config_signature_to_cells: dict[tuple[str, tuple[tuple[str, Any], ...]], list[str]] = {}
-    for source_provider in PROVIDER_KINDS:
+    for source_provider in providers:
         route = f"{source_provider}_to_g0"
         cells[route] = {}
         for config_name, hyperparameters in named_configs.items():
@@ -2210,6 +2514,7 @@ def run_round1_hyper_confirm_stage(study_manifest: str | Path) -> dict[str, Any]
                     checkpoint_steps=study["transfer_steps"],
                     architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
                     gp_policy=study["inputs"]["g0_policy"]["path"],
+                    ss_config=ss_config,
                 )
                 directories.append(str(cell_dir))
                 if torch.cuda.is_available():
@@ -2481,6 +2786,8 @@ def run_round1_final_test_stage(study_manifest: str | Path) -> dict[str, Any]:
     if not bool(study.get("test_locked", False)):
         raise RuntimeError("Test-v2 has already been unlocked or consumed.")
     root = Path(study["output_dir"])
+    providers = _study_provider_kinds(study)
+    ss_config = _study_ss_config(study)
     final_bdqn = json.loads(
         (root / "bdqn" / "final_selection.json").read_text(encoding="utf-8")
     )
@@ -2488,13 +2795,18 @@ def run_round1_final_test_stage(study_manifest: str | Path) -> dict[str, Any]:
     _mark_stage(manifest_path, study, "final_test", "running")
     outputs: dict[str, dict[str, str]] = {}
     for split, manifest_key in (("iid", "test_iid_v2"), ("ood", "test_ood_v2")):
+        baselines = ["fixed"]
+        if "ss" in providers:
+            baselines.append("ss")
+        baselines.extend(("random_concrete", "manual6_dqn", "gp"))
         paths = evaluate_gp_stack(
             gp_policy=selected_policy,
             scheduler_checkpoint=final_bdqn["scheduler_checkpoint"],
             scenario_manifest=study["scenarios"][manifest_key],
             output_dir=root / "final_test" / split,
-            baselines=("fixed", "random_concrete", "manual6_dqn", "gp"),
+            baselines=tuple(baselines),
             manual_architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
+            ss_config=ss_config,
             device=study["device"],
         )
         outputs[split] = {name: str(path) for name, path in paths.items()}
@@ -2560,6 +2872,8 @@ def preflight_round1_study(study_manifest: str | Path) -> dict[str, Any]:
 
     manifest_path, study = _load_study(study_manifest)
     root = Path(study["output_dir"])
+    providers = _study_provider_kinds(study)
+    ss_config = _study_ss_config(study)
     manifests = {
         name: load_scenario_manifest(path)
         for name, path in study["scenarios"].items()
@@ -2593,7 +2907,9 @@ def preflight_round1_study(study_manifest: str | Path) -> dict[str, Any]:
             max_env_steps=max(study["convergence_steps"]),
             device=study["device"],
         )
-        checkpoint = ensure_initial_checkpoint(root, seed=int(seed), config=config)
+        checkpoint = _study_initial_checkpoint(
+            study, root, seed=int(seed), config=config
+        )
         agent, _ = load_branching_checkpoint(
             checkpoint, device=study["device"], load_optimizer=False
         )
@@ -2605,7 +2921,7 @@ def preflight_round1_study(study_manifest: str | Path) -> dict[str, Any]:
                 "checkpoint_sha256": sha256_file(checkpoint),
                 "parameter_sha256": parameter_hash,
                 "provider_parameter_sha256": {
-                    provider: parameter_hash for provider in PROVIDER_KINDS
+                    provider: parameter_hash for provider in providers
                 },
                 "all_provider_tensors_identical": True,
             }
@@ -2622,8 +2938,9 @@ def preflight_round1_study(study_manifest: str | Path) -> dict[str, Any]:
                 provider,
                 architecture_checkpoint=study["inputs"]["architecture_checkpoint"]["path"],
                 gp_policy=study["inputs"]["g0_policy"]["path"],
+                ss_config=ss_config,
             )
-            for provider in PROVIDER_KINDS
+            for provider in providers
         },
         "shared_initial_weights": initial_records,
         "test_locked": bool(study["test_locked"]),
@@ -2832,11 +3149,16 @@ def build_cross_pairwise_statistics(
         grouped.setdefault(
             (str(row["training_provider"]), str(row["evaluation_provider"])), []
         ).append(row)
+    providers = tuple(
+        provider
+        for provider in PROVIDER_KINDS
+        if any(provider in key for key in grouped)
+    )
     results: list[dict[str, Any]] = []
     pair_index = 0
-    for evaluation_provider in PROVIDER_KINDS:
-        for left_index, left in enumerate(PROVIDER_KINDS[:-1]):
-            for right in PROVIDER_KINDS[left_index + 1 :]:
+    for evaluation_provider in providers:
+        for left_index, left in enumerate(providers[:-1]):
+            for right in providers[left_index + 1 :]:
                 results.append(
                     _paired_cross_comparison(
                         grouped[(left, evaluation_provider)],
@@ -2848,9 +3170,9 @@ def build_cross_pairwise_statistics(
                     )
                 )
                 pair_index += 1
-    for training_provider in PROVIDER_KINDS:
-        for left_index, left in enumerate(PROVIDER_KINDS[:-1]):
-            for right in PROVIDER_KINDS[left_index + 1 :]:
+    for training_provider in providers:
+        for left_index, left in enumerate(providers[:-1]):
+            for right in providers[left_index + 1 :]:
                 results.append(
                     _paired_cross_comparison(
                         grouped[(training_provider, left)],
@@ -2888,15 +3210,23 @@ def build_migration_pairwise_statistics(
         ("g0_to_g0", target_step, "arch_to_g0", target_step, "A→G_vs_G→G"),
         ("g0_to_g0", target_step, "fixed_to_g0", target_step, "F→G_vs_G→G"),
     ]
+    if ("ss_to_ss", int(target_step)) in rows_by_route_step:
+        comparisons.extend(
+            (
+                item
+                for item in (
+                    ("ss_to_ss", target_step, "ss_to_g0", target_step, "S→G_vs_S→S"),
+                    ("fixed_to_g0", target_step, "ss_to_g0", target_step, "S→G_vs_F→G"),
+                    ("arch_to_g0", target_step, "ss_to_g0", target_step, "S→G_vs_A→G"),
+                    ("g0_to_g0", target_step, "ss_to_g0", target_step, "S→G_vs_G→G"),
+                )
+            )
+        )
     comparisons.extend(
         (route, 0, route, target_step, f"{route}_continued_vs_t0")
-        for route in (
-            "fixed_to_fixed",
-            "fixed_to_g0",
-            "arch_to_arch",
-            "arch_to_g0",
-            "g0_to_g0",
-        )
+        for route in sorted({route for route, _ in rows_by_route_step})
+        if (route, 0) in rows_by_route_step
+        and (route, int(target_step)) in rows_by_route_step
     )
     results: list[dict[str, Any]] = []
     for index, (left_route, left_step, right_route, right_step, label) in enumerate(
@@ -2924,6 +3254,29 @@ def _mean_by(rows: Sequence[dict[str, Any]], key: str, value: str) -> tuple[list
     return x, [float(np.mean(grouped[item])) for item in x]
 
 
+def _convergence_cell_directories(root: Path) -> dict[str, list[Path]]:
+    """Resolve local or imported convergence cells from the T0 registry."""
+
+    selection_path = root / "bdqn" / "t0_selection.json"
+    recorded_cells: dict[str, dict[str, str]] = {}
+    if selection_path.is_file():
+        recorded_cells = json.loads(
+            selection_path.read_text(encoding="utf-8")
+        ).get("cells", {})
+    cell_directories: dict[str, list[Path]] = {}
+    for provider in PROVIDER_KINDS:
+        directories = [
+            Path(path) for path in recorded_cells.get(provider, {}).values()
+        ]
+        if not directories:
+            directories = list(
+                (root / "bdqn" / "convergence" / provider).glob("seed_*")
+            )
+        if directories:
+            cell_directories[provider] = directories
+    return cell_directories
+
+
 def _plot_bdqn_convergence(root: Path, output: Path) -> None:
     import matplotlib.pyplot as plt
 
@@ -2933,19 +3286,20 @@ def _plot_bdqn_convergence(root: Path, output: Path) -> None:
         ("mean_j", "Mean J"),
         ("mean_success_makespan", "Successful makespan"),
     )
-    for provider in PROVIDER_KINDS:
+    cell_directories = _convergence_cell_directories(root)
+    providers = tuple(cell_directories)
+    for provider in providers:
         summary_rows: list[dict[str, Any]] = []
         history_rows: list[dict[str, Any]] = []
-        for path in (root / "bdqn" / "convergence" / provider).glob(
-            "seed_*/validation/checkpoint_summary.csv"
-        ):
+        for directory in cell_directories[provider]:
+            summary_path = directory / "validation" / "checkpoint_summary.csv"
+            history_path = directory / "training_history.csv"
             summary_rows.extend(
-                row for row in _read_csv(path) if str(row["category"]) == "all"
+                row
+                for row in _read_csv(summary_path)
+                if str(row["category"]) == "all"
             )
-        for path in (root / "bdqn" / "convergence" / provider).glob(
-            "seed_*/training_history.csv"
-        ):
-            history_rows.extend(_read_csv(path))
+            history_rows.extend(_read_csv(history_path))
         for axis, (metric, title) in zip(axes.flat[:3], metrics, strict=True):
             x, y = _mean_by(summary_rows, "target_environment_steps", metric)
             axis.plot(x, y, marker="o", label=provider)
@@ -2981,9 +3335,18 @@ def _plot_cross_heatmap(root: Path, output: Path) -> None:
         for row in _read_csv(root / "bdqn" / "cross_matrix" / "cross_summary.csv")
         if str(row["category"]) == "all"
     ]
-    matrix = np.zeros((3, 3), dtype=np.float64)
-    for row_index, training in enumerate(PROVIDER_KINDS):
-        for column_index, testing in enumerate(PROVIDER_KINDS):
+    providers = tuple(
+        provider
+        for provider in PROVIDER_KINDS
+        if any(
+            row["training_provider"] == provider
+            or row["evaluation_provider"] == provider
+            for row in rows
+        )
+    )
+    matrix = np.zeros((len(providers), len(providers)), dtype=np.float64)
+    for row_index, training in enumerate(providers):
+        for column_index, testing in enumerate(providers):
             values = [
                 float(row["mean_j"])
                 for row in rows
@@ -2993,13 +3356,13 @@ def _plot_cross_heatmap(root: Path, output: Path) -> None:
             matrix[row_index, column_index] = float(np.mean(values))
     figure, axis = plt.subplots(figsize=(6.5, 5.5), constrained_layout=True)
     image = axis.imshow(matrix, cmap="viridis_r")
-    axis.set_xticks(range(3), PROVIDER_KINDS)
-    axis.set_yticks(range(3), PROVIDER_KINDS)
+    axis.set_xticks(range(len(providers)), providers)
+    axis.set_yticks(range(len(providers)), providers)
     axis.set_xlabel("Test provider")
     axis.set_ylabel("Training provider")
-    axis.set_title("3×3 provider cross-evaluation: mean J")
-    for row in range(3):
-        for column in range(3):
+    axis.set_title(f"{len(providers)}×{len(providers)} provider cross-evaluation: mean J")
+    for row in range(len(providers)):
+        for column in range(len(providers)):
             axis.text(column, row, f"{matrix[row, column]:.3f}", ha="center", va="center")
     figure.colorbar(image, ax=axis, label="Mean J (lower is better)")
     figure.savefig(output, dpi=180)
@@ -3168,6 +3531,9 @@ def build_round1_report(study_manifest: str | Path) -> dict[str, str]:
         (root / "bdqn" / "final_selection.json").read_text(encoding="utf-8")
     )
     final_gp = load_gp_policy(root / "gp" / "confirm" / "selected" / "gp_policy.json")
+    t0_selection = json.loads(
+        (root / "bdqn" / "t0_selection.json").read_text(encoding="utf-8")
+    )
     run_count = json.loads(
         (root / "gp" / "confirm" / "selected" / "run_count_convergence.json").read_text(
             encoding="utf-8"
@@ -3197,6 +3563,7 @@ def build_round1_report(study_manifest: str | Path) -> dict[str, str]:
         },
         "raw_result_locations": {
             "bdqn_convergence": str(root / "bdqn" / "convergence"),
+            "bdqn_convergence_cells": t0_selection.get("cells", {}),
             "provider_cross": str(root / "bdqn" / "cross_matrix"),
             "migration": str(root / "bdqn" / "migration"),
             "hyper_screen": str(root / "bdqn" / "hyper_screen"),

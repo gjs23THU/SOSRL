@@ -32,7 +32,7 @@ class ArchitectureDecision:
     candidate_count: int
     changed: bool
     valid: bool
-    diagnostics: dict[str, float] = field(default_factory=dict)
+    diagnostics: dict[str, float | int | str] = field(default_factory=dict)
 
 
 @runtime_checkable
