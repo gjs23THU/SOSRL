@@ -597,6 +597,7 @@ def train_bdqn_provider_cell(
 ) -> dict[str, Path]:
     """Train and validate one controlled provider/seed/checkpoint cell."""
 
+    config.learning_rate_at_episode(0)
     steps = _canonical_steps(checkpoint_steps)
     if int(config.max_env_steps or 0) != int(steps[-1]):
         raise ValueError("config.max_env_steps must equal the final checkpoint step.")
@@ -655,9 +656,14 @@ def train_bdqn_provider_cell(
     }
     if resuming:
         immutable_fields = ("provider", "seed", "config", "checkpoint_steps", "inputs")
-        changed = [
-            name for name in immutable_fields if existing.get(name) != cell_manifest.get(name)
-        ]
+        changed = []
+        for name in immutable_fields:
+            existing_value = existing.get(name)
+            current_value = cell_manifest.get(name)
+            if name == "config":
+                existing_value = asdict(BranchingDQNConfig(**existing_value))
+            if existing_value != current_value:
+                changed.append(name)
         if changed:
             raise ValueError(f"round-one cell inputs changed: {changed}")
         cell_manifest = existing
@@ -735,10 +741,23 @@ def train_bdqn_provider_cell(
             epsilon=epsilon,
             history=history,
         )
+    for row in history:
+        row_episode = int(row["episode"])
+        row.setdefault(
+            "learning_rate",
+            config.learning_rate_at_episode(row_episode),
+        )
+        row.setdefault(
+            "next_learning_rate",
+            config.learning_rate_at_episode(row_episode + 1),
+        )
     while total_steps < steps[-1]:
         payload = sampler.next_payload()
         mission_env = _scenario_environment(payload, provider_kind)
         used_epsilon = float(epsilon)
+        used_learning_rate = config.learning_rate_at_episode(episode)
+        for parameter_group in agent.optimizer.param_groups:
+            parameter_group["lr"] = used_learning_rate
         result = run_branching_episode(
             mission_env,
             provider,
@@ -763,6 +782,10 @@ def train_bdqn_provider_cell(
                 "seed": int(config.seed),
                 "scenario_hash": payload["scenario_hash"],
                 "next_epsilon": float(epsilon),
+                "learning_rate": float(used_learning_rate),
+                "next_learning_rate": float(
+                    config.learning_rate_at_episode(episode + 1)
+                ),
                 "replay_size": len(agent.replay),
             }
         )
@@ -783,6 +806,10 @@ def train_bdqn_provider_cell(
                     "actual_environment_steps": int(total_steps),
                     "episodes": int(episode),
                     "epsilon": float(epsilon),
+                    "learning_rate": float(used_learning_rate),
+                    "next_learning_rate": float(
+                        config.learning_rate_at_episode(episode)
+                    ),
                     "source_checkpoint_sha256": source_hash,
                     "provider_sha256": input_hash,
                     "train_manifest_hash": train["manifest_hash"],
@@ -1845,6 +1872,8 @@ def select_final_bdqn_confirmation(
 def _collect_imported_convergence(
     source_manifest: Path,
     source_study: dict[str, Any],
+    *,
+    selected_seeds: Sequence[int] | None = None,
 ) -> tuple[dict[str, dict[str, dict[str, str]]], dict[str, dict[str, str]]]:
     """Validate completed legacy cells and return immutable import records."""
 
@@ -1852,7 +1881,7 @@ def _collect_imported_convergence(
         raise ValueError("round-one augmentation requires a legacy three-provider study.")
     if source_study.get("stages", {}).get("preflight", {}).get("status") != "complete":
         raise ValueError("source round-one preflight is not complete.")
-    if (
+    if selected_seeds is None and (
         source_study.get("stages", {})
         .get("bdqn_convergence", {})
         .get("status")
@@ -1861,6 +1890,23 @@ def _collect_imported_convergence(
         raise ValueError("source round-one convergence is not complete.")
     if not bool(source_study.get("test_locked", False)):
         raise ValueError("cannot augment a study after Test-v2 was consumed.")
+
+    source_seeds = [int(seed) for seed in source_study["seeds"]]
+    if selected_seeds is None:
+        import_seeds = source_seeds
+    else:
+        requested_seeds = [int(seed) for seed in selected_seeds]
+        if not requested_seeds:
+            raise ValueError("augmentation seed subset must not be empty.")
+        if len(set(requested_seeds)) != len(requested_seeds):
+            raise ValueError("augmentation seed subset contains duplicates.")
+        unknown_seeds = sorted(set(requested_seeds) - set(source_seeds))
+        if unknown_seeds:
+            raise ValueError(
+                f"augmentation seed subset is absent from the source study: {unknown_seeds}."
+            )
+        requested_set = set(requested_seeds)
+        import_seeds = [seed for seed in source_seeds if seed in requested_set]
 
     source_root = Path(source_study["output_dir"])
     expected_steps = {int(step) for step in source_study["convergence_steps"]}
@@ -1872,7 +1918,7 @@ def _collect_imported_convergence(
         provider: {} for provider in LEGACY_PROVIDER_KINDS
     }
     shared: dict[str, dict[str, str]] = {}
-    for seed in source_study["seeds"]:
+    for seed in import_seeds:
         source_hashes: set[str] = set()
         source_paths: set[str] = set()
         for provider in LEGACY_PROVIDER_KINDS:
@@ -1969,6 +2015,7 @@ def initialize_round1_study(
     scenario_sizes: dict[str, int] | None = None,
     ss_config: HystereticCapacityConfig | None = None,
     augment_from: str | Path | None = None,
+    augment_seeds: Sequence[int] | None = None,
 ) -> Path:
     """Create the immutable inputs and preregistered matrices for the study."""
 
@@ -1976,6 +2023,8 @@ def initialize_round1_study(
     manifest_path = destination / "study_manifest.json"
     source_manifest: Path | None = None
     source_study: dict[str, Any] | None = None
+    if augment_seeds is not None and augment_from is None:
+        raise ValueError("augment_seeds requires augment_from.")
     if augment_from is not None:
         source_manifest, source_study = _load_study(augment_from)
         if destination == Path(source_study["output_dir"]).resolve():
@@ -2003,6 +2052,10 @@ def initialize_round1_study(
         if int(manifest.get("schema_version", 1)) >= ROUND1_MANIFEST_SCHEMA_VERSION:
             if manifest.get("ss_config") != resolved_ss_config.to_dict():
                 raise ValueError("round-one S/s-HCM configuration changed.")
+        if augment_seeds is not None:
+            requested_seed_set = {int(seed) for seed in augment_seeds}
+            if requested_seed_set != {int(seed) for seed in manifest["seeds"]}:
+                raise ValueError("round-one augmentation seed subset changed.")
         if manifest.get("stages", {}).get("preflight", {}).get("status") != "complete":
             preflight_round1_study(manifest_path)
         return manifest_path
@@ -2038,6 +2091,7 @@ def initialize_round1_study(
         imported_cells, shared_initial_checkpoints = _collect_imported_convergence(
             source_manifest,
             source_study,
+            selected_seeds=augment_seeds,
         )
         if architecture_path != Path(
             source_study["inputs"]["architecture_checkpoint"]["path"]
@@ -2056,9 +2110,24 @@ def initialize_round1_study(
             "registry": Path(source_study["scenario_registry"]),
         }
         resolved_base_seed = int(source_study["base_seed"])
-        seeds = list(source_study["seeds"])
-        discovery_seeds = list(source_study["discovery_seeds"])
-        confirmation_seeds = list(source_study["confirmation_seeds"])
+        imported_seed_set = {
+            int(seed) for seed in shared_initial_checkpoints
+        }
+        seeds = [
+            int(seed)
+            for seed in source_study["seeds"]
+            if int(seed) in imported_seed_set
+        ]
+        discovery_seeds = [
+            int(seed)
+            for seed in source_study["discovery_seeds"]
+            if int(seed) in imported_seed_set
+        ]
+        confirmation_seeds = [
+            int(seed)
+            for seed in source_study["confirmation_seeds"]
+            if int(seed) in imported_seed_set
+        ]
         convergence_steps = list(source_study["convergence_steps"])
         transfer_steps = list(source_study["transfer_steps"])
         hyperparameter_matrix = list(source_study["hyperparameter_matrix"])
@@ -2067,6 +2136,7 @@ def initialize_round1_study(
             "study_manifest": str(source_manifest),
             "study_manifest_sha256_at_import": sha256_file(source_manifest),
             "schema_version": int(source_study["schema_version"]),
+            "seed_subset": seeds,
         }
     manifest = {
         "schema_version": ROUND1_MANIFEST_SCHEMA_VERSION,

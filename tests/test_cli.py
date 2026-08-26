@@ -38,6 +38,8 @@ class UnifiedCliTests(unittest.TestCase):
                 "init-round1-study",
                 "run-round1-study",
                 "smoke-round1-study",
+                "solve-nsga2",
+                "solve-mopso",
             },
         )
 
@@ -171,11 +173,17 @@ class UnifiedCliTests(unittest.TestCase):
                 "--checkpoint-steps",
                 "0",
                 "10",
+                "--lr-end",
+                "0.00001",
+                "--lr-decay",
+                "0.9975",
             ]
         )
         self.assertEqual(round1_scenarios.test_iid_size, 1000)
         self.assertEqual(round1_cell.provider, "g0")
         self.assertEqual(round1_cell.checkpoint_steps, [0, 10])
+        self.assertEqual(round1_cell.lr_end, 0.00001)
+        self.assertEqual(round1_cell.lr_decay, 0.9975)
         ss_cell = parser.parse_args(
             [
                 "train-round1-bdqn-cell",
@@ -225,6 +233,12 @@ class UnifiedCliTests(unittest.TestCase):
                 "init-round1-study",
                 "--augment-from",
                 "round1/study_manifest.json",
+                "--augment-seeds",
+                "1",
+                "2",
+                "3",
+                "4",
+                "5",
                 "--output-dir",
                 "round1-v2",
             ]
@@ -233,6 +247,7 @@ class UnifiedCliTests(unittest.TestCase):
             round1_augment.augment_from,
             Path("round1/study_manifest.json"),
         )
+        self.assertEqual(round1_augment.augment_seeds, [1, 2, 3, 4, 5])
         with patch(
             "sosrl.workflows.round1_study.initialize_round1_study",
             return_value=Path("round1-v2/study_manifest.json"),
@@ -241,6 +256,10 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(
             initialize.call_args.kwargs["augment_from"],
             Path("round1/study_manifest.json"),
+        )
+        self.assertEqual(
+            initialize.call_args.kwargs["augment_seeds"],
+            [1, 2, 3, 4, 5],
         )
 
         with patch(
@@ -284,6 +303,97 @@ class UnifiedCliTests(unittest.TestCase):
             evaluation.flat_rule_models,
             [("flat128", Path("flat_rules.pt"))],
         )
+
+    def test_nsga2_command_parses_profile_and_overrides(self):
+        parser, _ = self.subcommands()
+        args = parser.parse_args(
+            [
+                "solve-nsga2",
+                "--scenario-manifest",
+                "scenarios.json",
+                "--scenario-indices",
+                "0",
+                "3",
+                "--profile",
+                "custom",
+                "--population-size",
+                "10",
+                "--max-evaluations",
+                "100",
+                "--evaluation-milestones",
+                "10",
+                "50",
+                "100",
+                "--runs",
+                "1",
+                "--architecture-change-weight",
+                "0.02",
+                "--peak-budget-penalty",
+                "15",
+                "--workers",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.command, "solve-nsga2")
+        self.assertEqual(args.scenario_indices, [0, 3])
+        self.assertEqual(args.population_size, 10)
+        self.assertEqual(args.max_evaluations, 100)
+        self.assertEqual(args.evaluation_milestones, [10, 50, 100])
+        self.assertEqual(args.runs, 1)
+        self.assertEqual(args.architecture_change_weight, 0.02)
+        self.assertEqual(args.peak_budget_penalty, 15.0)
+        self.assertEqual(args.workers, 2)
+
+    def test_mopso_command_parses_profile_and_overrides(self):
+        parser, _ = self.subcommands()
+        args = parser.parse_args(
+            [
+                "solve-mopso",
+                "--scenario-manifest",
+                "scenarios.json",
+                "--scenario-indices",
+                "0",
+                "3",
+                "--profile",
+                "custom",
+                "--swarm-size",
+                "20",
+                "--max-evaluations",
+                "300",
+                "--evaluation-milestones",
+                "20",
+                "100",
+                "300",
+                "--runs",
+                "2",
+                "--inertia-weight",
+                "0.7",
+                "--cognitive-coefficient",
+                "1.4",
+                "--social-coefficient",
+                "1.6",
+                "--max-velocity-rate",
+                "0.25",
+                "--archive-size",
+                "80",
+                "--workers",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.command, "solve-mopso")
+        self.assertEqual(args.scenario_indices, [0, 3])
+        self.assertEqual(args.swarm_size, 20)
+        self.assertEqual(args.max_evaluations, 300)
+        self.assertEqual(args.evaluation_milestones, [20, 100, 300])
+        self.assertEqual(args.runs, 2)
+        self.assertEqual(args.inertia_weight, 0.7)
+        self.assertEqual(args.cognitive_coefficient, 1.4)
+        self.assertEqual(args.social_coefficient, 1.6)
+        self.assertEqual(args.max_velocity_rate, 0.25)
+        self.assertEqual(args.archive_size, 80)
+        self.assertEqual(args.workers, 2)
 
     def test_auto_device_resolves_to_a_concrete_torch_device(self):
         self.assertIn(cli.resolve_device("auto"), {"cpu", "cuda"})

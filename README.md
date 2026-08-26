@@ -1,5 +1,43 @@
 # SOSRL 双层强化学习算法说明书
 
+## 动态架构—调度一体化 NSGA-II 基线
+
+项目提供一个不调用 GP 树、BDQN 或人工调度规则的逐场景 NSGA-II 基线。每个个体用 `OS | MS | AA` 同时表示工序顺序、工序—系统选择和 GP 的 203 个具体架构动作；解码器复用 GP 的动作合法性以及 `MissionEnv` 的时间窗、能力、尾插式调度与 80% 退款口径。Pareto 目标为 makespan 和 GP 对齐有效成本：最终净成本、架构变化代价与峰值超预算软罚项之和。
+
+安装固定依赖：
+
+```powershell
+& 'D:\software\anaconda3\envs\RL_env\python.exe' -m pip install -r requirements-nsga2.txt
+```
+
+默认快速档为种群 50、每次运行 5,000 次评价、每场景 3 个独立种子：
+
+```powershell
+& 'D:\software\anaconda3\envs\RL_env\python.exe' -m sosrl solve-nsga2 `
+  --scenario-manifest tmp\round1_smoke_20260823_v2\scenarios\test_iid_v2.json `
+  --scenario-indices 0 `
+  --profile fast `
+  --output-dir runs\nsga2
+```
+
+快速烟雾测试可选用 `--profile custom --population-size 10 --max-evaluations 100 --runs 1`。标准 GP 成本系数为 `--architecture-change-weight 0.01 --peak-budget-penalty 20`。每个场景目录会保存联合前沿、三类代表解、调度、架构轨迹、代际历史和运行清单；原始 AA 基因与 Baldwinian 修复后的有效动作表型同时保留。
+
+## 动态架构—调度 MOPSO 基线
+
+`solve-mopso` 使用与 NSGA-II 完全相同的 `OS/MS/AA`、动态解码器、软预算、约束违反度和代表解规则。粒子是 `3K` 维混合随机键：稳定排序得到 OS，分箱得到能力匹配的 MS 和 203 个 GP 对齐 AA 动作。算法只复用动作语义和共同环境，不调用 GP 或 BDQN。
+
+```powershell
+& 'D:\software\anaconda3\envs\RL_env\python.exe' -m sosrl solve-mopso `
+  --scenario-manifest tmp\round1_smoke_20260823_v2\scenarios\test_iid_v2.json `
+  --scenario-indices 0 `
+  --profile fast `
+  --output-dir runs\mopso
+```
+
+`fast` 为 50 粒子、5,000 次评价、3 次独立运行，`standard` 为 100/10,000/5；`custom` 可显式覆盖粒子数、评价预算、里程碑、运行数、MOPSO 系数、速度限制和档案容量。每个场景保存原始随机键、解码染色体、有效表型、Pareto 里程碑、代表解、调度和架构轨迹，可直接重放审计。
+
+小预算校准使用 `python -m scripts.run_mopso_budget_calibration`。它将 B/G 的 8 个正式场景按 shard 串行运行，已有完整 shard 会跳过，并输出 `scenario_budget_metrics.csv`、`budget_curve.csv`、`calibration_summary.json` 和 `calibration_report.md`；校准结论不会修改 `fast` 默认配置。
+
 ## Direct GP 上层策略
 
 项目现已支持用单棵 Genetic Programming 表达式树直接选择具体体系架构动作。GP在每次下层决策前对当前合法的KEEP、ADD、REMOVE和同类REPLACE候选评分；动作执行并刷新可行性后，冻结的Branching DQN再选择前沿task与active system。GP不再经过六个人工规则，也不会更新下层网络。

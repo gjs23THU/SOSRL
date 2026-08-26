@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import hashlib
+import json
 from typing import Any, Literal
 
 import numpy as np
@@ -83,6 +85,29 @@ def raw_architecture_actions() -> tuple[ArchitectureAction, ...]:
                     )
                 )
     return tuple(actions)
+
+
+@lru_cache(maxsize=1)
+def architecture_action_ids() -> dict[ArchitectureAction, int]:
+    """Return the stable canonical ID for every raw GP action."""
+    return {
+        action: action_id
+        for action_id, action in enumerate(raw_architecture_actions())
+    }
+
+
+def architecture_action_id(action: ArchitectureAction) -> int:
+    return int(architecture_action_ids()[action])
+
+
+@lru_cache(maxsize=1)
+def architecture_action_table_hash() -> str:
+    payload = json.dumps(
+        [action.to_dict() for action in raw_architecture_actions()],
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def effective_ready_time(mission_env: env_module.MissionEnv, sys_idx: int) -> float:

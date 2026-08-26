@@ -1,3 +1,4 @@
+import csv
 import json
 from pathlib import Path
 import tempfile
@@ -306,6 +307,25 @@ def test_completed_v1_convergence_can_be_imported_without_modifying_source():
         assert augmented["shared_initial_checkpoints"]["1"]["sha256"] == initial_hash
         assert augmented["stages"]["preflight"]["status"] == "complete"
 
+        running_source = json.loads(source_manifest.read_text(encoding="utf-8"))
+        running_source["stages"]["bdqn_convergence"]["status"] = "running"
+        running_source_manifest = source_root / "running_study_manifest.json"
+        running_source_manifest.write_text(
+            json.dumps(running_source), encoding="utf-8"
+        )
+        subset_manifest = initialize_round1_study(
+            output_dir=root / "augmented-subset-v2",
+            augment_from=running_source_manifest,
+            augment_seeds=[1],
+            device="auto",
+        )
+        subset = json.loads(subset_manifest.read_text(encoding="utf-8"))
+        assert subset["seeds"] == [1]
+        assert subset["imported_from"]["seed_subset"] == [1]
+        assert set(subset["imported_convergence_cells"]) == set(
+            LEGACY_PROVIDER_KINDS
+        )
+
         try:
             initialize_round1_study(
                 output_dir=root / "augmented-v2",
@@ -409,6 +429,9 @@ def test_interrupted_cell_resume_matches_continuous_training():
             buffer_size=10,
             min_buffer_size=1,
             target_update_interval=2,
+            lr=1e-4,
+            lr_end=1e-5,
+            lr_decay=0.5,
             seed=7,
             device="cpu",
         )
@@ -451,3 +474,14 @@ def test_interrupted_cell_resume_matches_continuous_training():
         assert Path(resumed_outputs["summary"]).read_text(encoding="utf-8") == Path(
             continuous_outputs["summary"]
         ).read_text(encoding="utf-8")
+        with (root / "continuous" / "training_history.csv").open(
+            encoding="utf-8", newline=""
+        ) as file:
+            history = list(csv.DictReader(file))
+        assert [float(row["learning_rate"]) for row in history] == [
+            1e-4,
+            5e-5,
+            2.5e-5,
+            1.25e-5,
+        ]
+        assert float(history[-1]["next_learning_rate"]) == 1e-5

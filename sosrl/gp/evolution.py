@@ -14,6 +14,7 @@ from typing import Any, Callable, Sequence
 from deap import base, gp, tools
 import numpy as np
 
+from ..objectives import gp_cost_breakdown
 from .config import GPArchitectureConfig
 from .primitives import build_primitive_set, ensure_deap_types, tree_within_limits
 
@@ -57,19 +58,21 @@ class EvolutionRunResult:
 
 def episode_objective(outcome: EpisodeOutcome) -> float:
     scale = max(float(outcome.scale), 1.0)
-    budget = max(float(outcome.budget), 1.0)
     remaining_penalty = (
         0.0
         if outcome.success
         else 1.0
         - float(outcome.completed_operations) / max(int(outcome.total_operations), 1)
     )
-    budget_excess = max(float(outcome.peak_net_cost) / budget - 1.0, 0.0)
+    cost = gp_cost_breakdown(
+        final_net_cost=outcome.final_net_cost,
+        peak_net_cost=outcome.peak_net_cost,
+        budget=outcome.budget,
+        architecture_changes=outcome.architecture_changes,
+    )
     return float(
         10.0 * float(outcome.makespan) / scale
-        + float(outcome.final_net_cost) / budget
-        + 20.0 * budget_excess**2
-        + 0.01 * int(outcome.architecture_changes)
+        + cost.gp_cost_score
         + 10.0 * remaining_penalty
     )
 

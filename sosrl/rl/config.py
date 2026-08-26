@@ -86,6 +86,8 @@ class BranchingDQNConfig:
     refund_rate: float = 0.8
     gamma: float = 0.99
     lr: float = 1e-4
+    lr_end: float | None = None
+    lr_decay: float = 1.0
     batch_size: int = 64
     buffer_size: int = 50000
     min_buffer_size: int = 1000
@@ -96,3 +98,17 @@ class BranchingDQNConfig:
     seed: int = 1
     device: str = default_device()
     log_interval: int = 10
+
+    def learning_rate_at_episode(self, episode: int) -> float:
+        """Return the exponentially decayed learning rate for one episode."""
+
+        if int(episode) < 0:
+            raise ValueError("episode must be non-negative.")
+        if float(self.lr) <= 0.0:
+            raise ValueError("lr must be positive.")
+        if not 0.0 < float(self.lr_decay) <= 1.0:
+            raise ValueError("lr_decay must be in (0, 1].")
+        floor = 0.0 if self.lr_end is None else float(self.lr_end)
+        if floor < 0.0 or floor > float(self.lr):
+            raise ValueError("lr_end must be between 0 and lr.")
+        return max(floor, float(self.lr) * float(self.lr_decay) ** int(episode))

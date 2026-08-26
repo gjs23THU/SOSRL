@@ -209,6 +209,19 @@ class BranchingActionSelectionTests(unittest.TestCase):
 
 
 class BranchingLearningTests(unittest.TestCase):
+    def test_episode_learning_rate_uses_exponential_decay_and_floor(self):
+        config = BranchingDQNConfig(
+            lr=1e-4,
+            lr_end=1e-5,
+            lr_decay=0.5,
+        )
+
+        self.assertEqual(config.learning_rate_at_episode(0), 1e-4)
+        self.assertEqual(config.learning_rate_at_episode(1), 5e-5)
+        self.assertEqual(config.learning_rate_at_episode(4), 1e-5)
+        with self.assertRaisesRegex(ValueError, "lr_decay"):
+            BranchingDQNConfig(lr_decay=1.1).learning_rate_at_episode(0)
+
     def test_double_dqn_target_uses_online_argmax_and_target_evaluation(self):
         config = BranchingDQNConfig(
             gamma=1.0,

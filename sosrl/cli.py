@@ -444,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
     round1_cell.add_argument("--max-env-steps", type=int)
     round1_cell.add_argument("--checkpoint-steps", nargs="+", type=int)
     round1_cell.add_argument("--lr", type=float)
+    round1_cell.add_argument("--lr-end", type=float)
+    round1_cell.add_argument("--lr-decay", type=float)
     round1_cell.add_argument("--batch-size", type=int)
     round1_cell.add_argument("--buffer-size", type=int)
     round1_cell.add_argument("--target-update-interval", type=int)
@@ -457,6 +459,7 @@ def build_parser() -> argparse.ArgumentParser:
     round1_init.add_argument("--architecture-checkpoint", type=Path)
     round1_init.add_argument("--gp-policy", type=Path)
     round1_init.add_argument("--augment-from", type=Path)
+    round1_init.add_argument("--augment-seeds", nargs="+", type=int)
     round1_init.add_argument("--output-dir", type=Path, required=True)
     round1_init.add_argument("--base-seed", type=int, default=20260824)
     round1_init.add_argument("--b-train-size", type=int, default=256)
@@ -496,6 +499,95 @@ def build_parser() -> argparse.ArgumentParser:
     round1_smoke.add_argument("--output-dir", type=Path, required=True)
     round1_smoke.add_argument("--seed", type=int, default=20260824)
     round1_smoke.set_defaults(handler=handle_smoke_round1_study)
+
+    solve_nsga2 = subparsers.add_parser(
+        "solve-nsga2",
+        help="Solve scenario manifests with integrated dynamic NSGA-II.",
+    )
+    solve_nsga2.add_argument("--scenario-manifest", type=Path, required=True)
+    solve_nsga2.add_argument("--scenario-indices", nargs="*", type=int)
+    solve_nsga2.add_argument(
+        "--profile",
+        choices=["fast", "standard", "custom"],
+        default="fast",
+    )
+    solve_nsga2.add_argument("--population-size", type=int)
+    solve_nsga2.add_argument("--max-evaluations", type=int)
+    solve_nsga2.add_argument(
+        "--evaluation-milestones",
+        nargs="*",
+        type=int,
+        help=(
+            "Save combined Pareto snapshots at these evaluation counts per "
+            "run; values must be population-size multiples."
+        ),
+    )
+    solve_nsga2.add_argument("--runs", type=int)
+    solve_nsga2.add_argument("--base-seed", type=int, default=20260825)
+    solve_nsga2.add_argument("--refund-rate", type=float)
+    solve_nsga2.add_argument(
+        "--architecture-change-weight", type=float, default=0.01
+    )
+    solve_nsga2.add_argument(
+        "--peak-budget-penalty", type=float, default=20.0
+    )
+    solve_nsga2.add_argument("--workers", type=int, default=1)
+    solve_nsga2.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs") / "nsga2",
+    )
+    solve_nsga2.set_defaults(handler=handle_solve_nsga2)
+
+    solve_mopso = subparsers.add_parser(
+        "solve-mopso",
+        help="Solve scenario manifests with mixed random-key MOPSO-CD.",
+    )
+    solve_mopso.add_argument("--scenario-manifest", type=Path, required=True)
+    solve_mopso.add_argument("--scenario-indices", nargs="*", type=int)
+    solve_mopso.add_argument(
+        "--profile",
+        choices=["fast", "standard", "custom"],
+        default="fast",
+    )
+    solve_mopso.add_argument("--swarm-size", type=int)
+    solve_mopso.add_argument("--max-evaluations", type=int)
+    solve_mopso.add_argument(
+        "--evaluation-milestones",
+        nargs="*",
+        type=int,
+        help=(
+            "Save combined Pareto snapshots at these evaluation counts per "
+            "run; values must be swarm-size multiples."
+        ),
+    )
+    solve_mopso.add_argument("--runs", type=int)
+    solve_mopso.add_argument("--base-seed", type=int, default=20260825)
+    solve_mopso.add_argument("--refund-rate", type=float)
+    solve_mopso.add_argument("--inertia-weight", type=float, default=0.729844)
+    solve_mopso.add_argument(
+        "--cognitive-coefficient", type=float, default=1.49618
+    )
+    solve_mopso.add_argument(
+        "--social-coefficient", type=float, default=1.49618
+    )
+    solve_mopso.add_argument(
+        "--max-velocity-rate", type=float, default=0.20
+    )
+    solve_mopso.add_argument("--archive-size", type=int, default=200)
+    solve_mopso.add_argument(
+        "--architecture-change-weight", type=float, default=0.01
+    )
+    solve_mopso.add_argument(
+        "--peak-budget-penalty", type=float, default=20.0
+    )
+    solve_mopso.add_argument("--workers", type=int, default=1)
+    solve_mopso.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("runs") / "mopso",
+    )
+    solve_mopso.set_defaults(handler=handle_solve_mopso)
     return parser
 
 
@@ -1156,6 +1248,87 @@ def handle_compare_schedulers(args) -> None:
     print_json({"summary": summary, "paired_comparisons": comparisons})
 
 
+def handle_solve_nsga2(args) -> None:
+    from .nsga2 import NSGA2Config, solve_manifest_nsga2
+
+    profiles = {
+        "fast": (50, 5000, 3),
+        "standard": (100, 10000, 5),
+        "custom": (50, 5000, 3),
+    }
+    population_size, max_evaluations, independent_runs = profiles[args.profile]
+    config = NSGA2Config(
+        population_size=(
+            population_size
+            if args.population_size is None
+            else args.population_size
+        ),
+        max_evaluations=(
+            max_evaluations
+            if args.max_evaluations is None
+            else args.max_evaluations
+        ),
+        independent_runs=(
+            independent_runs if args.runs is None else args.runs
+        ),
+        base_seed=args.base_seed,
+        workers=args.workers,
+        architecture_change_weight=args.architecture_change_weight,
+        peak_budget_penalty=args.peak_budget_penalty,
+        evaluation_milestones=tuple(args.evaluation_milestones or ()),
+    )
+    result = solve_manifest_nsga2(
+        args.scenario_manifest,
+        args.output_dir,
+        config=config,
+        scenario_indices=args.scenario_indices,
+        refund_rate=args.refund_rate,
+    )
+    print_json(result)
+
+
+def handle_solve_mopso(args) -> None:
+    from .mopso import MOPSOConfig, solve_manifest_mopso
+
+    profiles = {
+        "fast": (50, 5000, 3),
+        "standard": (100, 10000, 5),
+        "custom": (50, 5000, 3),
+    }
+    swarm_size, max_evaluations, independent_runs = profiles[args.profile]
+    config = MOPSOConfig(
+        swarm_size=(
+            swarm_size if args.swarm_size is None else args.swarm_size
+        ),
+        max_evaluations=(
+            max_evaluations
+            if args.max_evaluations is None
+            else args.max_evaluations
+        ),
+        independent_runs=(
+            independent_runs if args.runs is None else args.runs
+        ),
+        inertia_weight=args.inertia_weight,
+        cognitive_coefficient=args.cognitive_coefficient,
+        social_coefficient=args.social_coefficient,
+        max_velocity_rate=args.max_velocity_rate,
+        archive_size=args.archive_size,
+        base_seed=args.base_seed,
+        workers=args.workers,
+        architecture_change_weight=args.architecture_change_weight,
+        peak_budget_penalty=args.peak_budget_penalty,
+        evaluation_milestones=tuple(args.evaluation_milestones or ()),
+    )
+    result = solve_manifest_mopso(
+        args.scenario_manifest,
+        args.output_dir,
+        config=config,
+        scenario_indices=args.scenario_indices,
+        refund_rate=args.refund_rate,
+    )
+    print_json(result)
+
+
 def handle_generate_gp_scenarios(args) -> None:
     from .workflows import gp_architecture
 
@@ -1282,6 +1455,8 @@ def handle_train_round1_bdqn_cell(args) -> None:
     config = factory(seed=args.seed, max_env_steps=max_steps, device=args.device)
     overrides = {
         "lr": args.lr,
+        "lr_end": args.lr_end,
+        "lr_decay": args.lr_decay,
         "batch_size": args.batch_size,
         "buffer_size": args.buffer_size,
         "target_update_interval": args.target_update_interval,
@@ -1328,6 +1503,7 @@ def handle_initialize_round1_study(args) -> None:
             upper_threshold=args.ss_high_threshold,
         ),
         augment_from=args.augment_from,
+        augment_seeds=args.augment_seeds,
         scenario_sizes=(
             None
             if args.augment_from is not None
