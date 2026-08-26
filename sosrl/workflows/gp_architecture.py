@@ -56,23 +56,23 @@ from ..gp.provider import (
     RandomConcreteArchitectureProvider,
 )
 from ..rl.agent import ArchitectureDQNAgent
-from ..rl.checkpoint import load_branching_checkpoint
-from ..rl.branching import (
-    BranchingAction,
-    build_branching_observation,
-    collate_branching_observations,
-)
 from ..workflows import scheduler
 from . import evaluation
-from .branching import branching_episode_row, run_branching_episode
+from .branching import branching_episode_row
 from .hierarchical import AdaptiveScenarioPool
+from .scheduler_backends import (
+    SCHEDULER_BACKEND_KINDS,
+    SchedulerBackend,
+    load_scheduler_backend,
+    scheduler_parameter_hash,
+)
 
 
 GP_SCENARIO_SCHEMA_VERSION = 2
 SUPPORTED_GP_SCENARIO_SCHEMA_VERSIONS = (1, 2)
 SCENARIO_CATEGORIES = AdaptiveScenarioPool.CATEGORIES
 DEFAULT_REFUND_RATE = 0.8
-_WORKER_AGENT = None
+_WORKER_BACKEND = None
 _WORKER_PRESET = None
 _WORKER_PSET = None
 _WORKER_FUNCTIONS: dict[str, Any] = {}
@@ -284,7 +284,7 @@ def branching_parameter_hash(agent) -> str:
 
 
 def _episode_outcome(
-    agent,
+    backend: SchedulerBackend,
     score_function,
     feature_preset: str,
     scenario: dict[str, Any],
@@ -301,15 +301,7 @@ def _episode_outcome(
         score_function,
         feature_preset=feature_preset,
     )
-    result = run_branching_episode(
-        mission_env,
-        provider,
-        agent,
-        scheduler_epsilon=0.0,
-        update_scheduler=False,
-        store_experience=False,
-        measure_inference=False,
-    )
+    result = backend.run_episode(mission_env, provider)
     return EpisodeOutcome(
         success=bool(result["success"]),
         dead_end=bool(result["dead_end"]),
@@ -324,19 +316,22 @@ def _episode_outcome(
     )
 
 
-def _worker_initialize(checkpoint_path: str, feature_preset: str) -> None:
-    global _WORKER_AGENT, _WORKER_PRESET, _WORKER_PSET, _WORKER_FUNCTIONS
+def _worker_initialize(
+    backend_kind: str,
+    checkpoint_path: str,
+    feature_preset: str,
+) -> None:
+    global _WORKER_BACKEND, _WORKER_PRESET, _WORKER_PSET, _WORKER_FUNCTIONS
     torch.set_num_threads(1)
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
         pass
-    _WORKER_AGENT, _ = load_branching_checkpoint(
+    _WORKER_BACKEND = load_scheduler_backend(
+        backend_kind,
         checkpoint_path,
         device="cpu",
-        load_optimizer=False,
     )
-    freeze_branching_agent(_WORKER_AGENT)
     _WORKER_PRESET = feature_preset
     _WORKER_PSET = build_primitive_set(feature_names_for_preset(feature_preset))
     _WORKER_FUNCTIONS = {}
@@ -350,7 +345,7 @@ def _worker_evaluate(task):
         function = compile_individual(individual, _WORKER_PSET)
         _WORKER_FUNCTIONS[expression] = function
     return _episode_outcome(
-        _WORKER_AGENT,
+        _WORKER_BACKEND,
         function,
         _WORKER_PRESET,
         scenario,
@@ -385,41 +380,8 @@ def _apply_prevalidated_architecture_action(mission_env, action):
     )
 
 
-def _select_branching_actions_batch(agent, observations):
-    """Deterministic epsilon-zero BDQN selection for one trajectory wave."""
-    batch = collate_branching_observations(observations)
-    tensors = batch.to_torch(agent.device)
-    with torch.no_grad():
-        scores = agent.q_net(**tensors).scores
-        pair_mask = tensors["pair_mask"]
-        flat_indices = (
-            scores.masked_fill(~pair_mask, -torch.inf)
-            .reshape(scores.shape[0], -1)
-            .argmax(dim=1)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-    padded_systems = int(scores.shape[2])
-    actions = []
-    for observation, flat_index in zip(observations, flat_indices, strict=True):
-        task_idx, sys_idx = divmod(int(flat_index), padded_systems)
-        op_idx = int(observation.task_op_indices[task_idx])
-        if op_idx < 0:
-            raise RuntimeError("selected task has no frontier operation.")
-        actions.append(
-            BranchingAction(
-                task_idx=task_idx,
-                sys_idx=sys_idx,
-                op_idx=op_idx,
-                decision_version=int(observation.decision_version),
-            )
-        )
-    return actions
-
-
 def _shared_population_scenario_outcomes(
-    agent,
+    backend: SchedulerBackend,
     expressions: Sequence[str],
     score_functions: Sequence[Any],
     feature_preset: str,
@@ -489,32 +451,26 @@ def _shared_population_scenario_outcomes(
                 result = _apply_prevalidated_architecture_action(branch_env, action)
                 if not result.get("valid", False):
                     raise RuntimeError("shared GP evaluator selected an illegal action.")
-                observation = build_branching_observation(branch_env)
-                if not np.any(observation.pair_mask):
+                if not backend.has_feasible_action(branch_env):
                     outcome = _outcome_from_environment(
                         branch_env, success=False, dead_end=True
                     )
                     for policy_idx in branch_indices:
                         outcomes[policy_idx] = outcome
                     continue
-                pending.append(
-                    (branch_env, branch_indices, step_count, observation)
-                )
+                pending.append((branch_env, branch_indices, step_count))
 
         if not pending:
             groups = []
             continue
-        branching_actions = _select_branching_actions_batch(
-            agent, [item[3] for item in pending]
+        environment_actions = backend.select_environment_actions(
+            [item[0] for item in pending]
         )
         next_groups = []
-        for pending_item, branching_action in zip(
-            pending, branching_actions, strict=True
+        for pending_item, environment_action in zip(
+            pending, environment_actions, strict=True
         ):
-            branch_env, branch_indices, step_count, _ = pending_item
-            environment_action = agent.encode_environment_action(
-                branch_env, branching_action
-            )
+            branch_env, branch_indices, step_count = pending_item
             _, _, terminated, _, info = branch_env.step(environment_action)
             if terminated:
                 outcome = _outcome_from_environment(
@@ -544,7 +500,7 @@ def _worker_evaluate_population(task):
             _WORKER_FUNCTIONS[expression] = function
         functions.append(function)
     return _shared_population_scenario_outcomes(
-        _WORKER_AGENT,
+        _WORKER_BACKEND,
         expressions,
         functions,
         _WORKER_PRESET,
@@ -553,29 +509,34 @@ def _worker_evaluate_population(task):
 
 
 class ScenarioEvaluator:
-    """Evaluate individuals while loading the frozen BDQN once per process."""
+    """Evaluate individuals with an interchangeable frozen scheduler backend."""
 
     def __init__(
         self,
         *,
-        agent,
+        backend: SchedulerBackend,
+        scheduler_backend: str,
         scheduler_checkpoint: str | Path,
         feature_preset: str,
         workers: int,
     ):
-        self.agent = agent
+        self.backend = backend
         self.feature_preset = feature_preset
         self.pset = build_primitive_set(feature_names_for_preset(feature_preset))
         self.outcome_cache: dict[tuple[str, str], EpisodeOutcome] = {}
         self.pool = None
         if int(workers) > 1:
-            if torch.device(agent.device).type != "cpu":
-                raise ValueError("workers>1 requires a CPU branching scheduler.")
+            if backend.device.type != "cpu":
+                raise ValueError("workers>1 requires a CPU scheduler backend.")
             context = mp.get_context("spawn")
             self.pool = context.Pool(
                 processes=int(workers),
                 initializer=_worker_initialize,
-                initargs=(str(Path(scheduler_checkpoint).resolve()), feature_preset),
+                initargs=(
+                    str(scheduler_backend),
+                    str(Path(scheduler_checkpoint).resolve()),
+                    feature_preset,
+                ),
             )
 
     def evaluate(self, individual, scenarios):
@@ -598,7 +559,7 @@ class ScenarioEvaluator:
             function = compile_individual(individual, self.pset)
             computed = [
                 _episode_outcome(
-                    self.agent,
+                    self.backend,
                     function,
                     self.feature_preset,
                     scenarios[index],
@@ -651,7 +612,7 @@ class ScenarioEvaluator:
                     ]
                     computed_tasks.append(
                         _shared_population_scenario_outcomes(
-                            self.agent,
+                            self.backend,
                             expressions_for_scenario,
                             functions,
                             self.feature_preset,
@@ -684,7 +645,7 @@ class ScenarioEvaluator:
 
 
 def validate_policy_action_equivalence(
-    agent,
+    backend: SchedulerBackend,
     original_score_function,
     deployed_score_function,
     feature_preset: str,
@@ -725,14 +686,7 @@ def validate_policy_action_equivalence(
             budget=float(scenario.get("budget", 8000.0)),
             refund_rate=float(scenario.get("refund_rate", DEFAULT_REFUND_RATE)),
         )
-        run_branching_episode(
-            mission_env,
-            provider,
-            agent,
-            scheduler_epsilon=0.0,
-            update_scheduler=False,
-            store_experience=False,
-        )
+        backend.run_episode(mission_env, provider)
     return checked
 
 
@@ -775,6 +729,7 @@ def _git_commit() -> str:
 def train_gp_architecture(
     *,
     scheduler_checkpoint: str | Path,
+    scheduler_backend: str = "branching-dqn",
     scenario_dir: str | Path,
     output_dir: str | Path,
     config: GPArchitectureConfig,
@@ -794,15 +749,17 @@ def train_gp_architecture(
     validation_scenarios = validation_manifest["scenarios"]
     anchor = fixed_anchor_scenarios(train_scenarios, config.anchor_size)
 
-    agent, _ = load_branching_checkpoint(
+    if scheduler_backend not in SCHEDULER_BACKEND_KINDS:
+        raise ValueError(f"unknown scheduler backend: {scheduler_backend!r}")
+    backend = load_scheduler_backend(
+        scheduler_backend,
         scheduler_checkpoint,
         device=device,
-        load_optimizer=False,
     )
-    freeze_branching_agent(agent)
-    before_hash = branching_parameter_hash(agent)
+    before_hash = scheduler_parameter_hash(backend.agent)
     evaluator = ScenarioEvaluator(
-        agent=agent,
+        backend=backend,
+        scheduler_backend=scheduler_backend,
         scheduler_checkpoint=scheduler_checkpoint,
         feature_preset=config.feature_set,
         workers=config.workers,
@@ -864,7 +821,13 @@ def train_gp_architecture(
                 anchor_scenarios=anchor,
                 individual_evaluator=evaluator.evaluate,
                 checkpoint_path=run_dir / "evolution_state.pkl",
-                resume_state=resume_state if run_index == 0 else None,
+                resume_state=(
+                    resume_state
+                    if run_index == 0 and resume_state is not None
+                    else (run_dir / "evolution_state.pkl")
+                    if (run_dir / "evolution_state.pkl").is_file()
+                    else None
+                ),
                 progress_callback=report_generation,
                 population_evaluator=evaluator.evaluate_population,
             )
@@ -947,7 +910,8 @@ def train_gp_architecture(
     simplification_used = len(deployment_individual) < len(selected)
     if not simplification_used:
         deployment_individual = selected
-    bdqn_file_hash = sha256_file(scheduler_checkpoint)
+    scheduler_provenance = backend.provenance()
+    scheduler_file_hash = str(scheduler_provenance["checkpoint_sha256"])
     policy_path = output_dir / "gp_policy.json"
 
     def write_deployment(individual, simplified):
@@ -964,7 +928,12 @@ def train_gp_architecture(
                 "simplification_attempted": True,
                 "simplification_used": bool(simplified),
             },
-            bdqn_checkpoint_sha256=bdqn_file_hash,
+            training_scheduler=scheduler_provenance,
+            bdqn_checkpoint_sha256=(
+                scheduler_file_hash
+                if scheduler_backend == "branching-dqn"
+                else ""
+            ),
         )
         save_gp_policy(policy_path, artifact)
         return load_gp_policy(policy_path)
@@ -972,7 +941,7 @@ def train_gp_architecture(
     loaded = write_deployment(deployment_individual, simplification_used)
     try:
         equivalence_points = validate_policy_action_equivalence(
-            agent,
+            backend,
             selected_function,
             loaded.score_function,
             config.feature_set,
@@ -985,16 +954,19 @@ def train_gp_architecture(
         simplification_used = False
         loaded = write_deployment(deployment_individual, False)
         equivalence_points = validate_policy_action_equivalence(
-            agent,
+            backend,
             selected_function,
             loaded.score_function,
             config.feature_set,
             validation_scenarios,
         )
 
-    after_hash = branching_parameter_hash(agent)
+    after_hash = scheduler_parameter_hash(backend.agent)
     if after_hash != before_hash:
-        raise RuntimeError("frozen BDQN parameters changed during GP evolution.")
+        raise RuntimeError("frozen scheduler parameters changed during GP evolution.")
+    scheduler_file_hash_after = sha256_file(scheduler_checkpoint)
+    if scheduler_file_hash_after != scheduler_file_hash:
+        raise RuntimeError("frozen scheduler checkpoint changed during GP evolution.")
     _write_csv(output_dir / "generation_history.csv", generation_history)
     _write_csv(output_dir / "anchor_history.csv", anchor_history)
     _write_jsonl(output_dir / "candidate_rules.jsonl", candidate_rows)
@@ -1006,13 +978,14 @@ def train_gp_architecture(
         if path.exists():
             scenario_hashes[name] = load_scenario_manifest(path)["manifest_hash"]
     stack = {
-        "schema_version": 1,
+        "schema_version": 2,
         "gp_policy": str(policy_path.resolve()),
         "gp_policy_sha256": sha256_file(policy_path),
-        "branching_scheduler": str(scheduler_checkpoint.resolve()),
-        "branching_scheduler_sha256": bdqn_file_hash,
-        "branching_parameter_sha256_before": before_hash,
-        "branching_parameter_sha256_after": after_hash,
+        "training_scheduler": scheduler_provenance,
+        "scheduler_checkpoint_sha256_before": scheduler_file_hash,
+        "scheduler_checkpoint_sha256_after": scheduler_file_hash_after,
+        "scheduler_parameter_sha256_before": before_hash,
+        "scheduler_parameter_sha256_after": after_hash,
         "environment_config_sha256": sha256_file(syn.CONFIG_PATH),
         "scenario_manifest_hashes": scenario_hashes,
         "code_commit": _git_commit(),
@@ -1020,6 +993,15 @@ def train_gp_architecture(
         "validation_action_equivalence_points": int(equivalence_points),
         "simplification_used": bool(simplification_used),
     }
+    if scheduler_backend == "branching-dqn":
+        stack.update(
+            {
+                "branching_scheduler": str(scheduler_checkpoint.resolve()),
+                "branching_scheduler_sha256": scheduler_file_hash,
+                "branching_parameter_sha256_before": before_hash,
+                "branching_parameter_sha256_after": after_hash,
+            }
+        )
     stack_path = output_dir / "gp_stack_manifest.json"
     stack_path.write_text(
         json.dumps(stack, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1037,7 +1019,7 @@ def train_gp_architecture(
 
 def _evaluate_provider_records(
     provider,
-    branching_agent,
+    scheduler_backend: SchedulerBackend,
     scenarios: Sequence[dict[str, Any]],
     *,
     model: str,
@@ -1057,13 +1039,9 @@ def _evaluate_provider_records(
             budget=float(scenario.get("budget", 8000.0)),
             refund_rate=float(scenario.get("refund_rate", DEFAULT_REFUND_RATE)),
         )
-        result = run_branching_episode(
+        result = scheduler_backend.run_episode(
             mission_env,
             provider,
-            branching_agent,
-            scheduler_epsilon=0.0,
-            update_scheduler=False,
-            store_experience=False,
             measure_inference=True,
         )
         row = branching_episode_row(
@@ -1188,6 +1166,7 @@ def evaluate_gp_stack(
     *,
     gp_policy: str | Path,
     scheduler_checkpoint: str | Path,
+    scheduler_backend: str = "branching-dqn",
     scenario_manifest: str | Path,
     output_dir: str | Path,
     baselines: Sequence[str] = ("fixed", "ss", "random_concrete", "gp"),
@@ -1198,15 +1177,20 @@ def evaluate_gp_stack(
 ) -> dict[str, Path]:
     manifest = load_scenario_manifest(scenario_manifest)
     scenarios = manifest["scenarios"]
-    agent, _ = load_branching_checkpoint(
+    backend = load_scheduler_backend(
+        scheduler_backend,
         scheduler_checkpoint,
         device=device,
-        load_optimizer=False,
     )
-    freeze_branching_agent(agent)
     loaded_policy = load_gp_policy(gp_policy)
-    if loaded_policy.artifact.bdqn_checkpoint_sha256 != sha256_file(scheduler_checkpoint):
-        raise ValueError("GP policy and branching checkpoint hashes do not match.")
+    training_scheduler = dict(loaded_policy.artifact.training_scheduler)
+    actual_scheduler = backend.provenance()
+    checkpoint_binding = (
+        "matched"
+        if training_scheduler.get("checkpoint_sha256")
+        == actual_scheduler.get("checkpoint_sha256")
+        else "diagnostic_crossed"
+    )
     providers = {}
     if "fixed" in baselines:
         providers["fixed"] = FixedArchitectureProvider()
@@ -1234,7 +1218,7 @@ def evaluate_gp_stack(
     for label in baselines:
         model_rows, model_schedules = _evaluate_provider_records(
             providers[label],
-            agent,
+            backend,
             scenarios,
             model=label,
             collect_schedule=collect_schedule,
@@ -1242,6 +1226,14 @@ def evaluate_gp_stack(
         for row in model_rows:
             row["gp_tree_node_count"] = loaded_policy.artifact.node_count if label == "gp" else 0
             row["gp_tree_height"] = loaded_policy.artifact.height if label == "gp" else 0
+            row["scheduler_backend"] = str(scheduler_backend)
+            row["scheduler_checkpoint_sha256"] = actual_scheduler[
+                "checkpoint_sha256"
+            ]
+            row["gp_training_scheduler_backend"] = training_scheduler.get(
+                "kind", "unknown"
+            )
+            row["checkpoint_binding"] = checkpoint_binding
         rows.extend(model_rows)
         schedules.extend(model_schedules)
     comparisons = paired_gp_comparisons(rows, reference="gp") if "gp" in baselines else []

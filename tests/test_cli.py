@@ -22,6 +22,7 @@ class UnifiedCliTests(unittest.TestCase):
             commands,
             {
                 "train-scheduler",
+                "train-fixed-rule-scheduler",
                 "train-architecture",
                 "finetune",
                 "evaluate",
@@ -124,6 +125,7 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(train.population_size, 8)
         self.assertEqual(train.generations, 2)
         self.assertEqual(train.feature_set, "system_delta")
+        self.assertEqual(train.scheduler_backend, "branching-dqn")
         self.assertEqual(evaluate.baselines, ["fixed", "ss", "gp"])
         self.assertEqual(evaluate.ss_low_threshold, 0.4)
         self.assertEqual(evaluate.ss_high_threshold, 0.9)
@@ -147,6 +149,20 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(finetune.checkpoint_interval_steps, 10000)
         self.assertTrue(finetune.resume)
         self.assertTrue(finetune.skip_historical_test)
+
+        fixed_rule = parser.parse_args(
+            [
+                "train-fixed-rule-scheduler",
+                "--train-manifest",
+                "b/train.json",
+                "--validation-manifest",
+                "b/validation.json",
+                "--output-dir",
+                "rule-fixed",
+            ]
+        )
+        self.assertEqual(fixed_rule.max_env_steps, 200000)
+        self.assertEqual(fixed_rule.seed, 4)
 
         round1_scenarios = parser.parse_args(
             ["generate-round1-scenarios", "--output-dir", "round1"]
@@ -303,6 +319,36 @@ class UnifiedCliTests(unittest.TestCase):
             evaluation.flat_rule_models,
             [("flat128", Path("flat_rules.pt"))],
         )
+
+    def test_fixed_rule_handler_only_runs_the_scheduler_workflow(self):
+        parser, _ = self.subcommands()
+        args = parser.parse_args(
+            [
+                "train-fixed-rule-scheduler",
+                "--train-manifest",
+                "b/train.json",
+                "--validation-manifest",
+                "b/validation.json",
+                "--output-dir",
+                "rule-fixed",
+                "--max-env-steps",
+                "1",
+                "--checkpoint-steps",
+                "0",
+                "1",
+                "--device",
+                "cpu",
+            ]
+        )
+        with patch(
+            "sosrl.workflows.fixed_rule_scheduler.train_fixed_rule_scheduler",
+            return_value={"manifest": Path("rule-fixed/run_manifest.json")},
+        ) as train_fixed:
+            args.handler(args)
+
+        train_fixed.assert_called_once()
+        self.assertEqual(train_fixed.call_args.kwargs["max_env_steps"], 1)
+        self.assertEqual(train_fixed.call_args.kwargs["checkpoint_steps"], (0, 1))
 
     def test_nsga2_command_parses_profile_and_overrides(self):
         parser, _ = self.subcommands()

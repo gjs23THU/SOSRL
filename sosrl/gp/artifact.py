@@ -31,7 +31,8 @@ from .primitives import (
 )
 
 
-GP_POLICY_SCHEMA_VERSION = 1
+GP_POLICY_SCHEMA_VERSION = 2
+SUPPORTED_GP_POLICY_SCHEMA_VERSIONS = (1, 2)
 SCORE_DIRECTION = "minimize"
 TIE_BREAK_RULE = (
     "score, changed_system_count, kind_keep_add_remove_replace, "
@@ -169,6 +170,7 @@ class GPPolicyArtifact:
     validation_fitness: dict[str, float]
     evolution_config: dict[str, Any]
     system_pool_hash: str
+    training_scheduler: dict[str, Any]
     bdqn_checkpoint_sha256: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -189,11 +191,18 @@ def create_policy_artifact(
     feature_preset: str,
     validation_fitness: Mapping[str, float] | None = None,
     evolution_config: Mapping[str, Any] | None = None,
+    training_scheduler: Mapping[str, Any] | None = None,
     bdqn_checkpoint_sha256: str = "",
 ) -> GPPolicyArtifact:
     feature_names = feature_names_for_preset(feature_preset)
     expression = str(individual)
     parsed = validate_expression(expression, feature_names)
+    scheduler_record = dict(training_scheduler or {})
+    if not scheduler_record and bdqn_checkpoint_sha256:
+        scheduler_record = {
+            "kind": "branching-dqn",
+            "checkpoint_sha256": str(bdqn_checkpoint_sha256),
+        }
     return GPPolicyArtifact(
         schema_version=GP_POLICY_SCHEMA_VERSION,
         feature_schema_version=ARCH_FEATURE_SCHEMA_VERSION,
@@ -211,6 +220,7 @@ def create_policy_artifact(
         },
         evolution_config=dict(evolution_config or {}),
         system_pool_hash=system_pool_hash(),
+        training_scheduler=scheduler_record,
         bdqn_checkpoint_sha256=str(bdqn_checkpoint_sha256),
     )
 
@@ -229,9 +239,25 @@ def save_gp_policy(path: str | Path, artifact: GPPolicyArtifact) -> Path:
 def load_gp_policy(path: str | Path, *, verify_system_pool: bool = True) -> LoadedGPPolicy:
     with Path(path).open("r", encoding="utf-8") as file:
         payload = json.load(file)
-    artifact = GPPolicyArtifact(**payload)
-    if artifact.schema_version != GP_POLICY_SCHEMA_VERSION:
+    source_schema_version = int(payload.get("schema_version", -1))
+    if source_schema_version not in SUPPORTED_GP_POLICY_SCHEMA_VERSIONS:
         raise ValueError("unsupported GP policy schema version.")
+    if source_schema_version == 1:
+        legacy_hash = str(payload.get("bdqn_checkpoint_sha256", ""))
+        payload["schema_version"] = GP_POLICY_SCHEMA_VERSION
+        payload["training_scheduler"] = (
+            {
+                "kind": "branching-dqn",
+                "checkpoint_sha256": legacy_hash,
+                "migrated_from_schema_version": 1,
+            }
+            if legacy_hash
+            else {"kind": "unknown", "migrated_from_schema_version": 1}
+        )
+    else:
+        payload.setdefault("training_scheduler", {})
+        payload.setdefault("bdqn_checkpoint_sha256", "")
+    artifact = GPPolicyArtifact(**payload)
     if artifact.feature_schema_version != ARCH_FEATURE_SCHEMA_VERSION:
         raise ValueError("unsupported architecture feature schema version.")
     if artifact.primitive_set_version != PRIMITIVE_SET_VERSION:

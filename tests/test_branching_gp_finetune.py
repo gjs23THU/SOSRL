@@ -358,7 +358,7 @@ class BranchingGPFinetuneIntegrationTest(unittest.TestCase):
             )
             self.assertFalse(any(output_dir.rglob("*evolution*")))
 
-    def test_hash_mismatch_rejects_before_creating_output(self):
+    def test_scheduler_hash_mismatch_is_recorded_as_crossed_pairing(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             scheduler, gp_policy, scenario_dir = self._fixture(
@@ -366,19 +366,25 @@ class BranchingGPFinetuneIntegrationTest(unittest.TestCase):
             )
             output_dir = root / "run"
 
-            with self.assertRaisesRegex(ValueError, "does not match"):
-                finetune_branching_with_frozen_gp(
-                    scheduler_checkpoint=scheduler,
-                    gp_policy=gp_policy,
-                    scenario_dir=scenario_dir,
-                    output_dir=output_dir,
-                    extra_env_steps=4,
-                    checkpoint_interval_steps=1,
-                    device="cpu",
-                    skip_historical_test=True,
-                )
+            finetune_branching_with_frozen_gp(
+                scheduler_checkpoint=scheduler,
+                gp_policy=gp_policy,
+                scenario_dir=scenario_dir,
+                output_dir=output_dir,
+                extra_env_steps=4,
+                checkpoint_interval_steps=1,
+                device="cpu",
+                skip_historical_test=True,
+            )
 
-            self.assertFalse(output_dir.exists())
+            with (output_dir / "baseline" / "validation_results.csv").open(
+                newline="", encoding="utf-8"
+            ) as file:
+                rows = list(csv.DictReader(file))
+            self.assertTrue(rows)
+            self.assertTrue(
+                all(row["checkpoint_binding"] == "diagnostic_crossed" for row in rows)
+            )
 
 
 if __name__ == "__main__":

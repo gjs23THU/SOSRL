@@ -360,7 +360,8 @@ def evaluate_scheduler_with_frozen_gp(
     )
     agent.q_net.eval()
     actual_hash = sha256_file(scheduler_path)
-    bound_hash = str(loaded_gp_policy.artifact.bdqn_checkpoint_sha256)
+    training_scheduler = dict(loaded_gp_policy.artifact.training_scheduler)
+    bound_hash = str(training_scheduler.get("checkpoint_sha256", ""))
     binding = "matched" if actual_hash == bound_hash else "diagnostic_crossed"
     rows: list[dict[str, Any]] = []
     traces: list[dict[str, Any]] = []
@@ -393,6 +394,9 @@ def evaluate_scheduler_with_frozen_gp(
                         _outcome(mission_env, result)
                     ),
                     "g0_bound_scheduler_sha256": bound_hash,
+                    "g0_training_scheduler_backend": training_scheduler.get(
+                        "kind", "unknown"
+                    ),
                     "actual_scheduler_sha256": actual_hash,
                     "checkpoint_binding": binding,
                 }
@@ -1184,10 +1188,6 @@ def finetune_branching_with_frozen_gp(
         "gradient_clip": 10.0,
     }
     loaded_gp = load_gp_policy(gp_path)
-    if loaded_gp.artifact.bdqn_checkpoint_sha256 != input_records["b0_scheduler"][
-        "sha256"
-    ]:
-        raise ValueError("G0 artifact BDQN hash does not match the supplied B0 checkpoint.")
     manifest = initialize_run_directory(
         destination,
         config=workflow_config,

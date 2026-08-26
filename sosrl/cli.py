@@ -258,6 +258,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_scheduler_arguments(train_scheduler)
     train_scheduler.set_defaults(handler=handle_train_scheduler)
 
+    train_fixed_rule = subparsers.add_parser("train-fixed-rule-scheduler")
+    train_fixed_rule.add_argument("--train-manifest", type=Path, required=True)
+    train_fixed_rule.add_argument("--validation-manifest", type=Path, required=True)
+    train_fixed_rule.add_argument("--output-dir", type=Path, required=True)
+    train_fixed_rule.add_argument("--max-env-steps", type=int, default=200000)
+    train_fixed_rule.add_argument("--checkpoint-steps", type=int, nargs="+")
+    train_fixed_rule.add_argument("--gamma", type=float, default=0.99)
+    train_fixed_rule.add_argument("--lr", type=float, default=1e-3)
+    train_fixed_rule.add_argument("--batch-size", type=int, default=64)
+    train_fixed_rule.add_argument("--buffer-size", type=int, default=50000)
+    train_fixed_rule.add_argument("--min-buffer-size", type=int, default=1000)
+    train_fixed_rule.add_argument("--target-update-interval", type=int, default=250)
+    train_fixed_rule.add_argument("--epsilon-start", type=float, default=1.0)
+    train_fixed_rule.add_argument("--epsilon-end", type=float, default=0.05)
+    train_fixed_rule.add_argument("--epsilon-decay", type=float, default=0.995)
+    train_fixed_rule.add_argument("--hidden-dim", type=int, default=128)
+    train_fixed_rule.add_argument("--seed", type=int, default=4)
+    add_device(train_fixed_rule)
+    train_fixed_rule.set_defaults(handler=handle_train_fixed_rule_scheduler)
+
     train_architecture = subparsers.add_parser("train-architecture")
     add_hrl_arguments(train_architecture)
     train_architecture.add_argument(
@@ -341,6 +361,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     train_gp = subparsers.add_parser("train-gp-architecture")
     train_gp.add_argument("--scheduler-checkpoint", type=Path, required=True)
+    train_gp.add_argument(
+        "--scheduler-backend",
+        choices=["rule-dqn", "branching-dqn"],
+        default="branching-dqn",
+    )
     train_gp.add_argument("--scenario-dir", type=Path, required=True)
     train_gp.add_argument(
         "--feature-set",
@@ -368,6 +393,11 @@ def build_parser() -> argparse.ArgumentParser:
     evaluate_gp = subparsers.add_parser("evaluate-gp-stack")
     evaluate_gp.add_argument("--gp-policy", type=Path, required=True)
     evaluate_gp.add_argument("--scheduler-checkpoint", type=Path, required=True)
+    evaluate_gp.add_argument(
+        "--scheduler-backend",
+        choices=["rule-dqn", "branching-dqn"],
+        default="branching-dqn",
+    )
     evaluate_gp.add_argument("--scenario-manifest", type=Path, required=True)
     evaluate_gp.add_argument("--manual-architecture-checkpoint", type=Path)
     evaluate_gp.add_argument(
@@ -1287,6 +1317,47 @@ def handle_solve_nsga2(args) -> None:
     print_json(result)
 
 
+def handle_train_fixed_rule_scheduler(args) -> None:
+    from .workflows.fixed_rule_scheduler import (
+        DEFAULT_CHECKPOINT_STEPS,
+        train_fixed_rule_scheduler,
+    )
+
+    steps = tuple(args.checkpoint_steps or DEFAULT_CHECKPOINT_STEPS)
+    config = DQNConfig(
+        episodes=0,
+        scenario_pool_size=0,
+        scenario_order="sequential",
+        shared_mission=False,
+        rule_set="standard",
+        selected_system_num=None,
+        min_system_num=3,
+        max_system_num=22,
+        cost_limit=8000.0,
+        gamma=args.gamma,
+        lr=args.lr,
+        batch_size=args.batch_size,
+        buffer_size=args.buffer_size,
+        min_buffer_size=args.min_buffer_size,
+        target_update_interval=args.target_update_interval,
+        epsilon_start=args.epsilon_start,
+        epsilon_end=args.epsilon_end,
+        epsilon_decay=args.epsilon_decay,
+        hidden_dim=args.hidden_dim,
+        seed=args.seed,
+        device=resolve_device(args.device),
+    )
+    outputs = train_fixed_rule_scheduler(
+        output_dir=args.output_dir,
+        train_manifest=args.train_manifest,
+        validation_manifest=args.validation_manifest,
+        config=config,
+        max_env_steps=args.max_env_steps,
+        checkpoint_steps=steps,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
 def handle_solve_mopso(args) -> None:
     from .mopso import MOPSOConfig, solve_manifest_mopso
 
@@ -1360,6 +1431,7 @@ def handle_train_gp_architecture(args) -> None:
     )
     outputs = gp_architecture.train_gp_architecture(
         scheduler_checkpoint=args.scheduler_checkpoint,
+        scheduler_backend=args.scheduler_backend,
         scenario_dir=args.scenario_dir,
         output_dir=args.output_dir,
         config=config,
@@ -1376,6 +1448,7 @@ def handle_evaluate_gp_stack(args) -> None:
     outputs = gp_architecture.evaluate_gp_stack(
         gp_policy=args.gp_policy,
         scheduler_checkpoint=args.scheduler_checkpoint,
+        scheduler_backend=args.scheduler_backend,
         scenario_manifest=args.scenario_manifest,
         output_dir=args.output_dir,
         baselines=args.baselines,

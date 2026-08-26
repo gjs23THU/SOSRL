@@ -1,4 +1,5 @@
 import csv
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -200,6 +201,17 @@ class GPWorkflowTest(unittest.TestCase):
             self.assertEqual(set(outputs), expected)
             self.assertTrue(all(path.exists() for path in outputs.values()))
             self.assertEqual(before, branching_parameter_hash(restored))
+            stack = json.loads(
+                outputs["gp_stack_manifest"].read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                stack["scheduler_checkpoint_sha256_before"],
+                stack["scheduler_checkpoint_sha256_after"],
+            )
+            self.assertEqual(
+                stack["scheduler_parameter_sha256_before"],
+                stack["scheduler_parameter_sha256_after"],
+            )
             self.assertTrue(all(path.exists() for path in evaluation_outputs.values()))
             with evaluation_outputs["results"].open(encoding="utf-8-sig") as file:
                 rows = list(csv.DictReader(file))

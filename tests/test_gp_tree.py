@@ -107,6 +107,31 @@ class GPPrimitiveAndArtifactTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "feature schema"):
                 load_gp_policy(path)
 
+    def test_schema_v1_scheduler_binding_is_migrated(self):
+        names = feature_names_for_preset("system")
+        pset = build_primitive_set(names)
+        individual = individual_from_expression("progress", pset)
+        payload = create_policy_artifact(
+            individual,
+            feature_preset="system",
+            bdqn_checkpoint_sha256="a" * 64,
+        ).to_dict()
+        payload["schema_version"] = 1
+        payload.pop("training_scheduler")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "v1.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            loaded = load_gp_policy(path)
+
+        self.assertEqual(loaded.artifact.schema_version, 2)
+        self.assertEqual(
+            loaded.artifact.training_scheduler["kind"], "branching-dqn"
+        )
+        self.assertEqual(
+            loaded.artifact.training_scheduler["checkpoint_sha256"], "a" * 64
+        )
+
     def test_tree_limits_check_height_and_node_count(self):
         names = feature_names_for_preset("system")
         pset = build_primitive_set(names)
