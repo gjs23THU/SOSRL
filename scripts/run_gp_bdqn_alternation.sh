@@ -19,6 +19,7 @@ FORMAL_SCENARIOS="$SCENARIO_ROOT/formal"
 SMOKE_OUTPUT="$OUTPUT_ROOT/smoke_8x10x1_5k"
 FORMAL_OUTPUT="$OUTPUT_ROOT/formal_120x50x3_40k"
 STATUS_PATH="$OUTPUT_ROOT/pipeline_status.json"
+MAX_CPU_LOAD=${SOSRL_MAX_CPU_LOAD:-16.0}
 TEST_IID_MANIFEST="$ROUND1_ROOT/test_iid_v2.json"
 TEST_OOD_MANIFEST="$ROUND1_ROOT/test_ood_v2.json"
 if [[ ! -f "$TEST_IID_MANIFEST" ]]; then
@@ -174,8 +175,8 @@ resource_snapshot() {
 CURRENT_STAGE=resource_gate
 while true; do
   read -r CPU_LOAD MEM_KIB GPU_MIB DISK_KIB < <(resource_snapshot)
-  RESOURCE_DETAILS="cpu_load=$CPU_LOAD mem_available_kib=$MEM_KIB gpu_free_mib=$GPU_MIB disk_free_kib=$DISK_KIB"
-  if awk -v load="$CPU_LOAD" 'BEGIN {exit !(load <= 12.0)}' \
+  RESOURCE_DETAILS="cpu_load=$CPU_LOAD max_cpu_load=$MAX_CPU_LOAD mem_available_kib=$MEM_KIB gpu_free_mib=$GPU_MIB disk_free_kib=$DISK_KIB"
+  if awk -v load="$CPU_LOAD" -v maximum="$MAX_CPU_LOAD" 'BEGIN {exit !(load <= maximum)}' \
     && (( MEM_KIB >= 16777216 )) \
     && (( GPU_MIB >= 24576 )) \
     && (( DISK_KIB >= 52428800 )); then
