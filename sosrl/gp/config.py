@@ -37,6 +37,12 @@ class GPArchitectureConfig:
     anchor_size: int = 64
     anchor_interval: int = 10
     anchor_top_k: int = 10
+    convergence_interval: int = 0
+    convergence_threshold: float = 0.01
+    convergence_patience: int = 2
+    convergence_confirmation_windows: int = 1
+    min_generations: int = 0
+    parent_population_fraction: float = 0.30
     parsimony_coefficient: float = 0.001
     base_seed: int = 20260820
     workers: int = 1
@@ -52,6 +58,8 @@ class GPArchitectureConfig:
             "anchor_size": self.anchor_size,
             "anchor_interval": self.anchor_interval,
             "anchor_top_k": self.anchor_top_k,
+            "convergence_patience": self.convergence_patience,
+            "convergence_confirmation_windows": self.convergence_confirmation_windows,
             "max_nodes": self.max_nodes,
             "workers": self.workers,
         }
@@ -70,6 +78,14 @@ class GPArchitectureConfig:
             raise ValueError("max_nodes must be at least three.")
         if self.parsimony_coefficient < 0.0:
             raise ValueError("parsimony_coefficient cannot be negative.")
+        if not 0.0 < float(self.convergence_threshold) < 1.0:
+            raise ValueError("convergence_threshold must be in (0, 1).")
+        if int(self.convergence_interval) not in {0, int(self.anchor_interval)}:
+            raise ValueError("convergence_interval must equal anchor_interval.")
+        if int(self.min_generations) < 0 or int(self.min_generations) > int(self.generations):
+            raise ValueError("min_generations cannot exceed generations.")
+        if not 0.0 <= float(self.parent_population_fraction) <= 1.0:
+            raise ValueError("parent_population_fraction must be in [0, 1].")
         self._validate_probability_group(
             "variation",
             self.crossover_probability,

@@ -16,10 +16,15 @@ import numpy as np
 
 from ..objectives import gp_cost_breakdown
 from .config import GPArchitectureConfig
-from .primitives import build_primitive_set, ensure_deap_types, tree_within_limits
+from .primitives import (
+    build_primitive_set,
+    ensure_deap_types,
+    individual_from_expression,
+    tree_within_limits,
+)
 
 
-EVOLUTION_STATE_SCHEMA_VERSION = 2
+EVOLUTION_STATE_SCHEMA_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -54,6 +59,101 @@ class EvolutionRunResult:
     generation_history: list[dict[str, Any]]
     anchor_history: list[dict[str, Any]]
     candidates: list[dict[str, Any]]
+    actual_generations: int
+    stop_reason: str
+    convergence: dict[str, Any]
+
+
+def initial_gp_convergence_state() -> dict[str, Any]:
+    return {
+        "best_failure_count": None,
+        "best_failure_rate": None,
+        "best_raw_mean_j": None,
+        "stable_windows": 0,
+        "provisional_generation": None,
+        "confirmed_generation": None,
+        "observations": [],
+    }
+
+
+def update_gp_convergence(
+    state: dict[str, Any],
+    anchor_winner: dict[str, Any],
+    *,
+    completed_generations: int,
+    config: GPArchitectureConfig,
+) -> tuple[dict[str, Any], bool]:
+    """Update best-so-far anchor convergence and return whether it is confirmed."""
+
+    updated = copy.deepcopy(state)
+    failure = float(anchor_winner["failure_rate"])
+    failure_count = int(round(failure * int(config.anchor_size)))
+    raw_j = float(anchor_winner["raw_mean_j"])
+    previous_failure = updated["best_failure_rate"]
+    previous_j = updated["best_raw_mean_j"]
+    relative_improvement = None
+    failure_improved = previous_failure is not None and failure < float(previous_failure)
+
+    if previous_failure is None:
+        updated["best_failure_count"] = failure_count
+        updated["best_failure_rate"] = failure
+        updated["best_raw_mean_j"] = raw_j
+        updated["stable_windows"] = 0
+    elif failure_improved:
+        updated["best_failure_count"] = failure_count
+        updated["best_failure_rate"] = failure
+        updated["best_raw_mean_j"] = raw_j
+        updated["stable_windows"] = 0
+        updated["provisional_generation"] = None
+    elif failure == float(previous_failure):
+        best_j = float(previous_j)
+        if raw_j < best_j:
+            relative_improvement = (best_j - raw_j) / max(abs(best_j), 1e-12)
+            updated["best_raw_mean_j"] = raw_j
+        else:
+            relative_improvement = 0.0
+        if relative_improvement < float(config.convergence_threshold):
+            updated["stable_windows"] = int(updated["stable_windows"]) + 1
+        else:
+            updated["stable_windows"] = 0
+            updated["provisional_generation"] = None
+    else:
+        # A worse current population does not change best-so-far performance.
+        relative_improvement = 0.0
+        updated["stable_windows"] = int(updated["stable_windows"]) + 1
+
+    stable_windows = int(updated["stable_windows"])
+    if (
+        stable_windows >= int(config.convergence_patience)
+        and updated["provisional_generation"] is None
+    ):
+        updated["provisional_generation"] = int(completed_generations)
+    required = int(config.convergence_patience) + int(
+        config.convergence_confirmation_windows
+    )
+    confirmed = (
+        stable_windows >= required
+        and int(completed_generations) >= int(config.min_generations)
+    )
+    if confirmed:
+        updated["confirmed_generation"] = int(completed_generations)
+    updated["observations"].append(
+        {
+            "generation": int(completed_generations),
+            "anchor_failure_rate": failure,
+            "anchor_failure_count": failure_count,
+            "best_failure_count": int(updated["best_failure_count"]),
+            "anchor_raw_mean_j": raw_j,
+            "best_failure_rate": float(updated["best_failure_rate"]),
+            "best_raw_mean_j": float(updated["best_raw_mean_j"]),
+            "relative_best_j_improvement": relative_improvement,
+            "failure_improved": bool(failure_improved),
+            "stable_windows": stable_windows,
+            "provisional": updated["provisional_generation"] is not None,
+            "confirmed": bool(confirmed),
+        }
+    )
+    return updated, bool(confirmed)
 
 
 def episode_objective(outcome: EpisodeOutcome) -> float:
@@ -109,18 +209,29 @@ def _mutate_constant(individual, pset):
 
 def _bounded_mutation(individual, pset, config: GPArchitectureConfig):
     draw = random.random()
-    if draw < config.subtree_mutation_probability:
-        expression = partial(
-            gp.genFull,
-            min_=config.mutation_min_depth,
-            max_=config.mutation_max_depth,
-        )
-        return gp.mutUniform(individual, expr=expression, pset=pset)
-    if draw < (
-        config.subtree_mutation_probability + config.node_mutation_probability
-    ):
-        return gp.mutNodeReplacement(individual, pset=pset)
-    return _mutate_constant(individual, pset)
+    try:
+        if draw < config.subtree_mutation_probability:
+            expression = partial(
+                gp.genFull,
+                min_=config.mutation_min_depth,
+                max_=config.mutation_max_depth,
+            )
+            return gp.mutUniform(individual, expr=expression, pset=pset)
+        if draw < (
+            config.subtree_mutation_probability + config.node_mutation_probability
+        ):
+            return gp.mutNodeReplacement(individual, pset=pset)
+        return _mutate_constant(individual, pset)
+    except (IndexError, ValueError):
+        # DEAP's typed subtree generator cannot replace a literal-only legacy
+        # policy because this primitive set has no registered float terminal
+        # class beyond arguments and ephemeral constants.  Wrap the policy in
+        # a valid primitive so such a parent can still enter ordinary
+        # evolution; the static height/node decorators retain the original if
+        # the wrapper would exceed the configured bounds.
+        fallback = individual_from_expression(f"negative({individual})", pset)
+        individual[0 : len(individual)] = fallback
+        return (individual,)
 
 
 def build_toolbox(feature_names: Sequence[str], config: GPArchitectureConfig):
@@ -148,6 +259,65 @@ def build_toolbox(feature_names: Sequence[str], config: GPArchitectureConfig):
     toolbox.decorate("mutate", height_limit)
     toolbox.decorate("mutate", node_limit)
     return toolbox, pset
+
+
+def mixed_parent_population(
+    *,
+    toolbox,
+    pset,
+    config: GPArchitectureConfig,
+    parent_expression: str | None,
+) -> tuple[list[Any], dict[str, int]]:
+    """Create one exact parent, bounded parent mutants, and random diversity."""
+
+    if parent_expression is None:
+        population = toolbox.population(n=config.population_size)
+        return population, {
+            "parent": 0,
+            "parent_mutants": 0,
+            "random": int(config.population_size),
+        }
+    inherited = max(
+        1,
+        min(
+            int(config.population_size),
+            int(round(config.population_size * config.parent_population_fraction)),
+        ),
+    )
+    parent = individual_from_expression(parent_expression, pset)
+    if not tree_within_limits(
+        parent,
+        max_height=config.max_height,
+        max_nodes=config.max_nodes,
+    ):
+        raise ValueError("parent GP policy exceeds configured tree limits.")
+    population = [copy.deepcopy(parent)]
+    seen = {str(parent)}
+    target_mutants = inherited - 1
+    attempts = 0
+    max_attempts = max(100, target_mutants * 20)
+    while len(population) - 1 < target_mutants and attempts < max_attempts:
+        attempts += 1
+        try:
+            child, = toolbox.mutate(copy.deepcopy(parent))
+        except (IndexError, ValueError):
+            # A literal-only legacy policy may expose a DEAP return type with no
+            # compatible generated terminal.  The unfilled inherited quota is
+            # deliberately replaced by random diversity below.
+            continue
+        expression = str(child)
+        if expression in seen:
+            continue
+        seen.add(expression)
+        population.append(child)
+    actual_mutants = len(population) - 1
+    while len(population) < int(config.population_size):
+        population.append(toolbox.individual())
+    return population, {
+        "parent": 1,
+        "parent_mutants": int(actual_mutants),
+        "random": int(config.population_size) - 1 - int(actual_mutants),
+    }
 
 
 def _variation(population, toolbox, config: GPArchitectureConfig):
@@ -251,15 +421,19 @@ def evolve_architecture_policy(
         [Sequence[Any], Sequence[Any]], dict[str, Sequence[EpisodeOutcome]]
     ]
     | None = None,
+    parent_expression: str | None = None,
 ) -> EvolutionRunResult:
     """Run one independent, fully bounded GP evolution."""
     random.seed(run_seed)
     np.random.seed(run_seed % (2**32))
-    toolbox, _ = build_toolbox(feature_names, config)
+    toolbox, pset = build_toolbox(feature_names, config)
     generation_history: list[dict[str, Any]] = []
     anchor_history: list[dict[str, Any]] = []
     candidates: list[dict[str, Any]] = []
     start_generation = 0
+    convergence = initial_gp_convergence_state()
+    stop_reason: str | None = None
+    population_sources = {"parent": 0, "parent_mutants": 0, "random": 0}
 
     if resume_state is not None:
         with Path(resume_state).open("rb") as file:
@@ -275,12 +449,28 @@ def evolve_architecture_policy(
         anchor_history = state["anchor_history"]
         candidates = state["candidates"]
         start_generation = int(state["next_generation"])
+        convergence = copy.deepcopy(
+            state.get("convergence", initial_gp_convergence_state())
+        )
+        stop_reason = state.get("stop_reason")
+        population_sources = dict(state.get("population_sources", population_sources))
         random.setstate(state["random_state"])
         np.random.set_state(state["numpy_random_state"])
     else:
-        population = toolbox.population(n=config.population_size)
+        population, population_sources = mixed_parent_population(
+            toolbox=toolbox,
+            pset=pset,
+            config=config,
+            parent_expression=parent_expression,
+        )
 
-    for generation in range(start_generation, config.generations):
+    last_generation = start_generation - 1
+    for generation in (
+        ()
+        if stop_reason == "converged"
+        else range(start_generation, config.generations)
+    ):
+        last_generation = generation
         if generation > 0 or start_generation > 0:
             population = _variation(population, toolbox, config)
         scenarios = batch_sampler(run_seed, generation)
@@ -307,6 +497,15 @@ def evolve_architecture_policy(
         if progress_callback is not None:
             progress_callback(dict(row))
 
+        if generation == 0 and parent_expression is not None:
+            parent = next(
+                item for item in population if str(item) == str(parent_expression)
+            )
+            candidates.append(
+                _candidate_row(parent, generation, "parent_seed", run_seed)
+            )
+
+        confirmed = False
         if (generation + 1) % config.anchor_interval == 0:
             top = tools.selBest(population, min(config.anchor_top_k, len(population)))
             anchor_copies = [copy.deepcopy(item) for item in top]
@@ -317,13 +516,22 @@ def evolve_architecture_policy(
                 config,
                 population_evaluator=population_evaluator,
             )
-            for rank, individual in enumerate(tools.selBest(anchor_copies, len(anchor_copies)), 1):
+            ranked_anchors = tools.selBest(anchor_copies, len(anchor_copies))
+            for rank, individual in enumerate(ranked_anchors, 1):
                 anchor_row = _candidate_row(
                     individual, generation, "anchor", run_seed
                 )
                 anchor_row["anchor_rank"] = rank
                 anchor_history.append(anchor_row)
                 candidates.append(dict(anchor_row))
+            convergence, confirmed = update_gp_convergence(
+                convergence,
+                anchor_history[-len(ranked_anchors)],
+                completed_generations=generation + 1,
+                config=config,
+            )
+            if confirmed:
+                stop_reason = "converged"
 
         if checkpoint_path is not None:
             _atomic_pickle(
@@ -338,17 +546,25 @@ def evolve_architecture_policy(
                     "generation_history": generation_history,
                     "anchor_history": anchor_history,
                     "candidates": candidates,
+                    "convergence": convergence,
+                    "stop_reason": stop_reason,
+                    "population_sources": population_sources,
                     "random_state": random.getstate(),
                     "numpy_random_state": np.random.get_state(),
                 },
             )
+        if confirmed:
+            break
 
+    actual_generations = max(last_generation + 1, start_generation)
+    if stop_reason is None:
+        stop_reason = "max_generations_reached"
     final_top = tools.selBest(population, min(10, len(population)))
     for individual in final_top:
         candidates.append(
             _candidate_row(
                 individual,
-                config.generations - 1,
+                max(actual_generations - 1, 0),
                 "final_top10",
                 run_seed,
             )
@@ -359,4 +575,13 @@ def evolve_architecture_policy(
         generation_history=generation_history,
         anchor_history=anchor_history,
         candidates=candidates,
+        actual_generations=int(actual_generations),
+        stop_reason=str(stop_reason),
+        convergence={
+            **convergence,
+            "stop_reason": str(stop_reason),
+            "actual_generations": int(actual_generations),
+            "max_generations": int(config.generations),
+            "population_sources": population_sources,
+        },
     )

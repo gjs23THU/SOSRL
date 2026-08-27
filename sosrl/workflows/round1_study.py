@@ -494,6 +494,7 @@ def _agent_from_source(
     *,
     source_checkpoint: str | Path,
     config: BranchingDQNConfig,
+    reset_learn_step: bool = False,
 ) -> BranchingDQNAgent:
     source, _ = load_branching_checkpoint(
         source_checkpoint,
@@ -503,7 +504,7 @@ def _agent_from_source(
     agent = BranchingDQNAgent(config)
     agent.q_net.load_state_dict(source.q_net.state_dict())
     agent.target_net.load_state_dict(source.target_net.state_dict())
-    agent.learn_step = int(source.learn_step)
+    agent.learn_step = 0 if reset_learn_step else int(source.learn_step)
     return agent
 
 
@@ -594,6 +595,7 @@ def train_bdqn_provider_cell(
     gp_policy: str | Path | None = None,
     ss_config: HystereticCapacityConfig | None = None,
     stop_after_checkpoint: int | None = None,
+    reset_learn_step: bool = False,
 ) -> dict[str, Path]:
     """Train and validate one controlled provider/seed/checkpoint cell."""
 
@@ -652,14 +654,24 @@ def train_bdqn_provider_cell(
         "seed": int(config.seed),
         "config": asdict(config),
         "checkpoint_steps": list(steps),
+        "reset_learn_step": bool(reset_learn_step),
         "inputs": cell_inputs,
     }
     if resuming:
-        immutable_fields = ("provider", "seed", "config", "checkpoint_steps", "inputs")
+        immutable_fields = (
+            "provider",
+            "seed",
+            "config",
+            "checkpoint_steps",
+            "inputs",
+            "reset_learn_step",
+        )
         changed = []
         for name in immutable_fields:
             existing_value = existing.get(name)
             current_value = cell_manifest.get(name)
+            if name == "reset_learn_step":
+                existing_value = bool(existing.get(name, False))
             if name == "config":
                 existing_value = asdict(BranchingDQNConfig(**existing_value))
             if existing_value != current_value:
@@ -712,7 +724,11 @@ def train_bdqn_provider_cell(
         if resumed_checkpoint not in checkpoint_paths.values():
             raise ValueError("resume state points outside the registered cell checkpoints.")
     else:
-        agent = _agent_from_source(source_checkpoint=source_checkpoint, config=config)
+        agent = _agent_from_source(
+            source_checkpoint=source_checkpoint,
+            config=config,
+            reset_learn_step=bool(reset_learn_step),
+        )
         zero_path = checkpoints_dir / "checkpoint_0.pt"
         _save_branching_checkpoint_atomic(
             agent,

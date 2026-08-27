@@ -197,6 +197,7 @@ class GPWorkflowTest(unittest.TestCase):
                 "anchor_history",
                 "candidate_rules",
                 "validation_results",
+                "convergence",
             }
             self.assertEqual(set(outputs), expected)
             self.assertTrue(all(path.exists() for path in outputs.values()))

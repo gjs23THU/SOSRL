@@ -373,12 +373,24 @@ def build_parser() -> argparse.ArgumentParser:
         default="system_delta",
     )
     train_gp.add_argument("--population-size", type=int, default=200)
-    train_gp.add_argument("--generations", type=int, default=80)
+    train_gp.add_argument(
+        "--generations", "--max-generations", dest="generations", type=int, default=80
+    )
     train_gp.add_argument("--runs", type=int, default=10)
     train_gp.add_argument("--train-batch-size", type=int, default=16)
     train_gp.add_argument("--anchor-size", type=int, default=64)
-    train_gp.add_argument("--anchor-interval", type=int, default=10)
+    train_gp.add_argument("--anchor-interval", type=int, default=5)
     train_gp.add_argument("--anchor-top-k", type=int, default=10)
+    train_gp.add_argument("--parent-gp-policy", type=Path)
+    train_gp.add_argument("--parent-population-fraction", type=float, default=0.30)
+    train_gp.add_argument("--convergence-interval", type=int)
+    train_gp.add_argument("--convergence-threshold", type=float, default=0.01)
+    train_gp.add_argument("--convergence-patience", type=int, default=2)
+    train_gp.add_argument(
+        "--convergence-confirmation-windows", type=int, default=1
+    )
+    train_gp.add_argument("--min-generations", type=int, default=20)
+    train_gp.add_argument("--skip-test-evaluation", action="store_true")
     train_gp.add_argument("--workers", type=int, default=1)
     train_gp.add_argument("--base-seed", type=int, default=20260820)
     train_gp.add_argument("--resume-state", type=Path)
@@ -455,6 +467,57 @@ def build_parser() -> argparse.ArgumentParser:
     round1_scenarios.add_argument("--test-ood-size", type=int, default=500)
     round1_scenarios.add_argument("--output-dir", type=Path, required=True)
     round1_scenarios.set_defaults(handler=handle_generate_round1_scenarios)
+
+    alternating_scenarios = subparsers.add_parser(
+        "generate-alternation-scenarios"
+    )
+    alternating_scenarios.add_argument(
+        "--existing-manifest", action="append", type=Path, required=True
+    )
+    alternating_scenarios.add_argument("--gate-iid-size", type=int, default=512)
+    alternating_scenarios.add_argument("--gate-ood-size", type=int, default=256)
+    alternating_scenarios.add_argument("--final-iid-size", type=int, default=1000)
+    alternating_scenarios.add_argument("--final-ood-size", type=int, default=500)
+    alternating_scenarios.add_argument("--output-dir", type=Path, required=True)
+    alternating_scenarios.set_defaults(
+        handler=handle_generate_alternation_scenarios
+    )
+
+    alternate = subparsers.add_parser("run-gp-bdqn-alternation")
+    alternate.add_argument("--base-gp-policy", type=Path, required=True)
+    alternate.add_argument(
+        "--base-scheduler-checkpoint", type=Path, required=True
+    )
+    alternate.add_argument("--scenario-dir", type=Path, required=True)
+    alternate.add_argument("--gate-iid-manifest", type=Path, required=True)
+    alternate.add_argument("--gate-ood-manifest", type=Path, required=True)
+    alternate.add_argument("--final-iid-manifest", type=Path, required=True)
+    alternate.add_argument("--final-ood-manifest", type=Path, required=True)
+    alternate.add_argument("--output-dir", type=Path, required=True)
+    alternate.add_argument("--gp-population-size", type=int, default=120)
+    alternate.add_argument("--gp-max-generations", type=int, default=50)
+    alternate.add_argument("--gp-runs", type=int, default=3)
+    alternate.add_argument("--gp-workers", type=int, default=12)
+    alternate.add_argument("--gp-min-generations", type=int, default=20)
+    alternate.add_argument("--gp-convergence-interval", type=int, default=5)
+    alternate.add_argument("--gp-base-seed", type=int, default=20260820)
+    alternate.add_argument("--bdqn-max-env-steps", type=int, default=40000)
+    alternate.add_argument(
+        "--bdqn-checkpoint-interval", type=int, default=5000
+    )
+    alternate.add_argument(
+        "--bdqn-min-convergence-steps", type=int, default=20000
+    )
+    alternate.add_argument(
+        "--bdqn-round1-seeds", nargs=3, type=int, default=(4, 5, 6)
+    )
+    alternate.add_argument(
+        "--bdqn-round2-seeds", nargs=3, type=int, default=(7, 8, 9)
+    )
+    alternate.add_argument("--bdqn-parallel-jobs", type=int, default=3)
+    alternate.add_argument("--gp-device", default="cpu")
+    alternate.add_argument("--bdqn-device", default="auto")
+    alternate.set_defaults(handler=handle_run_gp_bdqn_alternation)
 
     round1_cell = subparsers.add_parser("train-round1-bdqn-cell")
     round1_cell.add_argument(
@@ -1425,6 +1488,16 @@ def handle_train_gp_architecture(args) -> None:
         anchor_size=args.anchor_size,
         anchor_interval=args.anchor_interval,
         anchor_top_k=args.anchor_top_k,
+        convergence_interval=(
+            args.anchor_interval
+            if args.convergence_interval is None
+            else args.convergence_interval
+        ),
+        convergence_threshold=args.convergence_threshold,
+        convergence_patience=args.convergence_patience,
+        convergence_confirmation_windows=args.convergence_confirmation_windows,
+        min_generations=min(args.min_generations, args.generations),
+        parent_population_fraction=args.parent_population_fraction,
         workers=args.workers,
         base_seed=args.base_seed,
         feature_set=args.feature_set,
@@ -1437,6 +1510,8 @@ def handle_train_gp_architecture(args) -> None:
         config=config,
         device=resolve_device(args.device),
         resume_state=args.resume_state,
+        parent_gp_policy=args.parent_gp_policy,
+        skip_test_evaluation=args.skip_test_evaluation,
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 
@@ -1499,6 +1574,55 @@ def handle_generate_round1_scenarios(args) -> None:
         g_validation_size=args.g_validation_size,
         test_iid_size=args.test_iid_size,
         test_ood_size=args.test_ood_size,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_generate_alternation_scenarios(args) -> None:
+    from .workflows.alternating_stack import (
+        generate_alternation_evaluation_scenarios,
+    )
+
+    outputs = generate_alternation_evaluation_scenarios(
+        args.output_dir,
+        existing_manifests=args.existing_manifest,
+        gate_iid_size=args.gate_iid_size,
+        gate_ood_size=args.gate_ood_size,
+        final_iid_size=args.final_iid_size,
+        final_ood_size=args.final_ood_size,
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_run_gp_bdqn_alternation(args) -> None:
+    from .workflows.alternating_stack import run_gp_bdqn_alternation
+
+    outputs = run_gp_bdqn_alternation(
+        base_gp_policy=args.base_gp_policy,
+        base_scheduler_checkpoint=args.base_scheduler_checkpoint,
+        scenario_dir=args.scenario_dir,
+        gate_iid_manifest=args.gate_iid_manifest,
+        gate_ood_manifest=args.gate_ood_manifest,
+        final_iid_manifest=args.final_iid_manifest,
+        final_ood_manifest=args.final_ood_manifest,
+        output_dir=args.output_dir,
+        gp_population_size=args.gp_population_size,
+        gp_max_generations=args.gp_max_generations,
+        gp_runs=args.gp_runs,
+        gp_workers=args.gp_workers,
+        gp_min_generations=args.gp_min_generations,
+        gp_convergence_interval=args.gp_convergence_interval,
+        gp_base_seed=args.gp_base_seed,
+        bdqn_max_env_steps=args.bdqn_max_env_steps,
+        bdqn_checkpoint_interval=args.bdqn_checkpoint_interval,
+        bdqn_min_convergence_steps=args.bdqn_min_convergence_steps,
+        bdqn_round1_seeds=args.bdqn_round1_seeds,
+        bdqn_round2_seeds=args.bdqn_round2_seeds,
+        bdqn_parallel_jobs=args.bdqn_parallel_jobs,
+        gp_device=resolve_device(args.gp_device),
+        bdqn_device=(
+            "auto" if args.bdqn_device == "auto" else resolve_device(args.bdqn_device)
+        ),
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 

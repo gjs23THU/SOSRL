@@ -35,10 +35,12 @@ class UnifiedCliTests(unittest.TestCase):
                 "evaluate-gp-stack",
                 "finetune-branching-with-gp",
                 "generate-round1-scenarios",
+                "generate-alternation-scenarios",
                 "train-round1-bdqn-cell",
                 "init-round1-study",
                 "run-round1-study",
                 "smoke-round1-study",
+                "run-gp-bdqn-alternation",
                 "solve-nsga2",
                 "solve-mopso",
             },
@@ -126,6 +128,7 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(train.generations, 2)
         self.assertEqual(train.feature_set, "system_delta")
         self.assertEqual(train.scheduler_backend, "branching-dqn")
+        self.assertEqual(train.anchor_interval, 5)
         self.assertEqual(evaluate.baselines, ["fixed", "ss", "gp"])
         self.assertEqual(evaluate.ss_low_threshold, 0.4)
         self.assertEqual(evaluate.ss_high_threshold, 0.9)
@@ -244,6 +247,42 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(round1_init.b_train_size, 256)
         self.assertEqual(round1_run.stage, "gp-discovery")
         self.assertEqual(round1_run.workers, 4)
+        alternating_scenarios = parser.parse_args(
+            [
+                "generate-alternation-scenarios",
+                "--existing-manifest",
+                "round1/train.json",
+                "--output-dir",
+                "alternation-scenarios",
+            ]
+        )
+        alternation = parser.parse_args(
+            [
+                "run-gp-bdqn-alternation",
+                "--base-gp-policy",
+                "g0.json",
+                "--base-scheduler-checkpoint",
+                "b0.pt",
+                "--scenario-dir",
+                "round1/g",
+                "--gate-iid-manifest",
+                "gate_iid.json",
+                "--gate-ood-manifest",
+                "gate_ood.json",
+                "--final-iid-manifest",
+                "final_iid.json",
+                "--final-ood-manifest",
+                "final_ood.json",
+                "--output-dir",
+                "alternation",
+            ]
+        )
+        self.assertEqual(alternating_scenarios.gate_iid_size, 512)
+        self.assertEqual(alternation.gp_population_size, 120)
+        self.assertEqual(alternation.gp_max_generations, 50)
+        self.assertEqual(alternation.bdqn_max_env_steps, 40000)
+        self.assertEqual(alternation.bdqn_round1_seeds, (4, 5, 6))
+        self.assertEqual(alternation.bdqn_round2_seeds, (7, 8, 9))
         round1_augment = parser.parse_args(
             [
                 "init-round1-study",

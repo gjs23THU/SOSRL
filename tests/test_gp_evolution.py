@@ -6,8 +6,12 @@ from sosrl.gp.config import GPArchitectureConfig
 from sosrl.gp.evolution import (
     EpisodeOutcome,
     aggregate_fitness,
+    build_toolbox,
     episode_objective,
     evolve_architecture_policy,
+    initial_gp_convergence_state,
+    mixed_parent_population,
+    update_gp_convergence,
 )
 from sosrl.gp.features import feature_names_for_preset
 
@@ -28,6 +32,78 @@ def outcome(*, success=True, completed=4, peak=8000.0, changes=0):
 
 
 class GPEvolutionTest(unittest.TestCase):
+    def test_parent_population_has_exact_parent_mutants_and_random_diversity(self):
+        config = GPArchitectureConfig(
+            population_size=10,
+            generations=2,
+            independent_runs=1,
+            elite_count=1,
+            anchor_interval=1,
+            parent_population_fraction=0.30,
+        )
+        names = feature_names_for_preset("system")
+        toolbox, pset = build_toolbox(names, config)
+        parent = f"add({names[0]}, {names[1]})"
+
+        population, sources = mixed_parent_population(
+            toolbox=toolbox,
+            pset=pset,
+            config=config,
+            parent_expression=parent,
+        )
+
+        self.assertEqual(len(population), 10)
+        self.assertEqual(sources, {"parent": 1, "parent_mutants": 2, "random": 7})
+        self.assertEqual(sum(str(item) == parent for item in population), 1)
+
+    def test_online_convergence_requires_two_windows_and_confirmation(self):
+        config = GPArchitectureConfig(
+            population_size=8,
+            generations=50,
+            independent_runs=1,
+            elite_count=1,
+            anchor_interval=5,
+            convergence_interval=5,
+            min_generations=20,
+        )
+        state = initial_gp_convergence_state()
+        stopped = []
+        for generation, raw_j in ((5, 10.0), (10, 9.95), (15, 9.94), (20, 9.93)):
+            state, confirmed = update_gp_convergence(
+                state,
+                {"failure_rate": 0.0, "raw_mean_j": raw_j},
+                completed_generations=generation,
+                config=config,
+            )
+            stopped.append(confirmed)
+
+        self.assertEqual(stopped, [False, False, False, True])
+        self.assertEqual(state["provisional_generation"], 15)
+        self.assertEqual(state["confirmed_generation"], 20)
+
+    def test_online_convergence_resets_after_meaningful_improvement(self):
+        config = GPArchitectureConfig(
+            population_size=8,
+            generations=50,
+            independent_runs=1,
+            elite_count=1,
+            anchor_interval=5,
+            convergence_interval=5,
+            min_generations=20,
+        )
+        state = initial_gp_convergence_state()
+        for generation, raw_j in ((5, 10.0), (10, 9.95), (15, 9.0)):
+            state, confirmed = update_gp_convergence(
+                state,
+                {"failure_rate": 0.0, "raw_mean_j": raw_j},
+                completed_generations=generation,
+                config=config,
+            )
+
+        self.assertFalse(confirmed)
+        self.assertEqual(state["stable_windows"], 0)
+        self.assertIsNone(state["provisional_generation"])
+
     def test_episode_fitness_formula(self):
         self.assertAlmostEqual(episode_objective(outcome()), 5.5)
         self.assertAlmostEqual(
@@ -120,6 +196,8 @@ class GPEvolutionTest(unittest.TestCase):
 
         self.assertEqual(first.generation_history, second.generation_history)
         self.assertEqual(first.anchor_history, second.anchor_history)
+        self.assertEqual(first.stop_reason, "max_generations_reached")
+        self.assertEqual(first.actual_generations, 2)
         self.assertTrue(all(item.height <= 6 for item in first.population))
         self.assertTrue(all(len(item) <= 40 for item in first.population))
 

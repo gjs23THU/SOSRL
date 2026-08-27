@@ -8,6 +8,7 @@ import csv
 import hashlib
 import json
 import multiprocessing as mp
+import os
 from pathlib import Path
 import random
 import subprocess
@@ -528,6 +529,8 @@ class ScenarioEvaluator:
         if int(workers) > 1:
             if backend.device.type != "cpu":
                 raise ValueError("workers>1 requires a CPU scheduler backend.")
+            os.environ["OMP_NUM_THREADS"] = "1"
+            os.environ["MKL_NUM_THREADS"] = "1"
             context = mp.get_context("spawn")
             self.pool = context.Pool(
                 processes=int(workers),
@@ -735,6 +738,8 @@ def train_gp_architecture(
     config: GPArchitectureConfig,
     device: str = "cpu",
     resume_state: str | Path | None = None,
+    parent_gp_policy: str | Path | None = None,
+    skip_test_evaluation: bool = False,
 ) -> dict[str, Path]:
     """Evolve independent runs, validate all candidates, and lock one JSON rule."""
     if config.workers > 1 and torch.device(device).type != "cpu":
@@ -748,6 +753,15 @@ def train_gp_architecture(
     train_scenarios = train_manifest["scenarios"]
     validation_scenarios = validation_manifest["scenarios"]
     anchor = fixed_anchor_scenarios(train_scenarios, config.anchor_size)
+    parent_path = None if parent_gp_policy is None else Path(parent_gp_policy).resolve()
+    parent_expression = None
+    parent_policy_hash = None
+    if parent_path is not None:
+        loaded_parent = load_gp_policy(parent_path)
+        if loaded_parent.artifact.feature_preset != config.feature_set:
+            raise ValueError("parent GP policy feature preset does not match training.")
+        parent_expression = str(loaded_parent.artifact.expression)
+        parent_policy_hash = sha256_file(parent_path)
 
     if scheduler_backend not in SCHEDULER_BACKEND_KINDS:
         raise ValueError(f"unknown scheduler backend: {scheduler_backend!r}")
@@ -757,6 +771,7 @@ def train_gp_architecture(
         device=device,
     )
     before_hash = scheduler_parameter_hash(backend.agent)
+    before_replay_size = len(backend.agent.replay)
     evaluator = ScenarioEvaluator(
         backend=backend,
         scheduler_backend=scheduler_backend,
@@ -767,6 +782,7 @@ def train_gp_architecture(
     generation_history = []
     anchor_history = []
     candidate_rows = []
+    run_convergence = []
     try:
         for run_index in range(config.independent_runs):
             evaluator.outcome_cache.clear()
@@ -830,10 +846,28 @@ def train_gp_architecture(
                 ),
                 progress_callback=report_generation,
                 population_evaluator=evaluator.evaluate_population,
+                parent_expression=parent_expression,
             )
             generation_history.extend(result.generation_history)
             anchor_history.extend(result.anchor_history)
             candidate_rows.extend(result.candidates)
+            convergence_record = {
+                "run_index": int(run_index),
+                "run_seed": int(run_seed),
+                **result.convergence,
+            }
+            run_convergence.append(convergence_record)
+            run_dir.mkdir(parents=True, exist_ok=True)
+            (run_dir / "convergence.json").write_text(
+                json.dumps(
+                    convergence_record,
+                    ensure_ascii=False,
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
 
         evaluator.outcome_cache.clear()
         expressions = sorted({row["expression"] for row in candidate_rows})
@@ -967,13 +1001,19 @@ def train_gp_architecture(
     scheduler_file_hash_after = sha256_file(scheduler_checkpoint)
     if scheduler_file_hash_after != scheduler_file_hash:
         raise RuntimeError("frozen scheduler checkpoint changed during GP evolution.")
+    after_replay_size = len(backend.agent.replay)
+    if after_replay_size != before_replay_size:
+        raise RuntimeError("frozen scheduler replay changed during GP evolution.")
     _write_csv(output_dir / "generation_history.csv", generation_history)
     _write_csv(output_dir / "anchor_history.csv", anchor_history)
     _write_jsonl(output_dir / "candidate_rules.jsonl", candidate_rows)
     _write_csv(output_dir / "validation_results.csv", validation_rows)
 
     scenario_hashes = {}
-    for name in ("train", "validation", "test_iid", "test_ood"):
+    scenario_names = ["train", "validation"]
+    if not skip_test_evaluation:
+        scenario_names.extend(("test_iid", "test_ood"))
+    for name in scenario_names:
         path = scenario_dir / f"{name}.json"
         if path.exists():
             scenario_hashes[name] = load_scenario_manifest(path)["manifest_hash"]
@@ -986,12 +1026,21 @@ def train_gp_architecture(
         "scheduler_checkpoint_sha256_after": scheduler_file_hash_after,
         "scheduler_parameter_sha256_before": before_hash,
         "scheduler_parameter_sha256_after": after_hash,
+        "scheduler_replay_size_before": int(before_replay_size),
+        "scheduler_replay_size_after": int(after_replay_size),
         "environment_config_sha256": sha256_file(syn.CONFIG_PATH),
         "scenario_manifest_hashes": scenario_hashes,
         "code_commit": _git_commit(),
         "base_seed": config.base_seed,
         "validation_action_equivalence_points": int(equivalence_points),
         "simplification_used": bool(simplification_used),
+        "parent_gp_policy": (
+            None
+            if parent_path is None
+            else {"path": str(parent_path), "sha256": parent_policy_hash}
+        ),
+        "skip_test_evaluation": bool(skip_test_evaluation),
+        "run_convergence": run_convergence,
     }
     if scheduler_backend == "branching-dqn":
         stack.update(
@@ -1007,6 +1056,30 @@ def train_gp_architecture(
         json.dumps(stack, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    convergence_path = output_dir / "convergence.json"
+    convergence_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "status": (
+                    "converged_all_runs"
+                    if all(row["stop_reason"] == "converged" for row in run_convergence)
+                    else "max_generations_reached"
+                    if all(
+                        row["stop_reason"] == "max_generations_reached"
+                        for row in run_convergence
+                    )
+                    else "mixed_stop_reasons"
+                ),
+                "runs": run_convergence,
+            },
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return {
         "gp_policy": policy_path,
         "gp_stack_manifest": stack_path,
@@ -1014,6 +1087,7 @@ def train_gp_architecture(
         "anchor_history": output_dir / "anchor_history.csv",
         "candidate_rules": output_dir / "candidate_rules.jsonl",
         "validation_results": output_dir / "validation_results.csv",
+        "convergence": convergence_path,
     }
 
 
