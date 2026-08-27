@@ -19,6 +19,14 @@ FORMAL_SCENARIOS="$SCENARIO_ROOT/formal"
 SMOKE_OUTPUT="$OUTPUT_ROOT/smoke_8x10x1_5k"
 FORMAL_OUTPUT="$OUTPUT_ROOT/formal_120x50x3_40k"
 STATUS_PATH="$OUTPUT_ROOT/pipeline_status.json"
+TEST_IID_MANIFEST="$ROUND1_ROOT/test_iid_v2.json"
+TEST_OOD_MANIFEST="$ROUND1_ROOT/test_ood_v2.json"
+if [[ ! -f "$TEST_IID_MANIFEST" ]]; then
+  TEST_IID_MANIFEST="$ROUND1_ROOT/test_iid.json"
+fi
+if [[ ! -f "$TEST_OOD_MANIFEST" ]]; then
+  TEST_OOD_MANIFEST="$ROUND1_ROOT/test_ood.json"
+fi
 
 if [[ -e "$OUTPUT_ROOT" && "${SOSRL_ALLOW_RESUME:-0}" != "1" ]]; then
   echo "output root already exists; set SOSRL_ALLOW_RESUME=1 to resume: $OUTPUT_ROOT" >&2
@@ -36,8 +44,8 @@ EXISTING_MANIFESTS=(
   "$ROUND1_ROOT/b/validation.json"
   "$ROUND1_ROOT/g/train.json"
   "$ROUND1_ROOT/g/validation.json"
-  "$ROUND1_ROOT/test_iid.json"
-  "$ROUND1_ROOT/test_ood.json"
+  "$TEST_IID_MANIFEST"
+  "$TEST_OOD_MANIFEST"
 )
 for required in "$PYTHON_BIN" "$G0_POLICY" "$B0_CHECKPOINT" "${EXISTING_MANIFESTS[@]}"; do
   if [[ ! -e "$required" ]]; then
