@@ -152,6 +152,10 @@ def test_alternation_scenario_generator_is_disjoint_from_existing_manifest():
             gate_ood_size=4,
             final_iid_size=4,
             final_ood_size=4,
+            gate_iid_seed=20261010,
+            gate_ood_seed=20261011,
+            final_iid_seed=20261012,
+            final_ood_seed=20261013,
         )
         hashes = set(
             row["scenario_hash"]
@@ -162,6 +166,10 @@ def test_alternation_scenario_generator_is_disjoint_from_existing_manifest():
             generated_hashes = {row["scenario_hash"] for row in generated["scenarios"]}
             assert not hashes & generated_hashes
             hashes.update(generated_hashes)
+        assert load_scenario_manifest(outputs["gate_iid"])["seed"] == 20261010
+        assert load_scenario_manifest(outputs["gate_ood"])["seed"] == 20261011
+        assert load_scenario_manifest(outputs["final_iid"])["seed"] == 20261012
+        assert load_scenario_manifest(outputs["final_ood"])["seed"] == 20261013
 
 
 def test_full_two_round_smoke_and_resume_preserve_learning_rate_reset():

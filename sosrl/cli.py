@@ -478,6 +478,10 @@ def build_parser() -> argparse.ArgumentParser:
     alternating_scenarios.add_argument("--gate-ood-size", type=int, default=256)
     alternating_scenarios.add_argument("--final-iid-size", type=int, default=1000)
     alternating_scenarios.add_argument("--final-ood-size", type=int, default=500)
+    alternating_scenarios.add_argument("--gate-iid-seed", type=int, default=20260910)
+    alternating_scenarios.add_argument("--gate-ood-seed", type=int, default=20260911)
+    alternating_scenarios.add_argument("--final-iid-seed", type=int, default=20260912)
+    alternating_scenarios.add_argument("--final-ood-seed", type=int, default=20260913)
     alternating_scenarios.add_argument("--output-dir", type=Path, required=True)
     alternating_scenarios.set_defaults(
         handler=handle_generate_alternation_scenarios
@@ -1590,6 +1594,10 @@ def handle_generate_alternation_scenarios(args) -> None:
         gate_ood_size=args.gate_ood_size,
         final_iid_size=args.final_iid_size,
         final_ood_size=args.final_ood_size,
+        gate_iid_seed=args.gate_iid_seed,
+        gate_ood_seed=args.gate_ood_seed,
+        final_iid_seed=args.final_iid_seed,
+        final_ood_seed=args.final_ood_seed,
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 

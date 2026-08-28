@@ -252,6 +252,14 @@ class UnifiedCliTests(unittest.TestCase):
                 "generate-alternation-scenarios",
                 "--existing-manifest",
                 "round1/train.json",
+                "--gate-iid-seed",
+                "20261010",
+                "--gate-ood-seed",
+                "20261011",
+                "--final-iid-seed",
+                "20261012",
+                "--final-ood-seed",
+                "20261013",
                 "--output-dir",
                 "alternation-scenarios",
             ]
@@ -278,6 +286,10 @@ class UnifiedCliTests(unittest.TestCase):
             ]
         )
         self.assertEqual(alternating_scenarios.gate_iid_size, 512)
+        self.assertEqual(alternating_scenarios.gate_iid_seed, 20261010)
+        self.assertEqual(alternating_scenarios.gate_ood_seed, 20261011)
+        self.assertEqual(alternating_scenarios.final_iid_seed, 20261012)
+        self.assertEqual(alternating_scenarios.final_ood_seed, 20261013)
         self.assertEqual(alternation.gp_population_size, 120)
         self.assertEqual(alternation.gp_max_generations, 50)
         self.assertEqual(alternation.bdqn_max_env_steps, 40000)
