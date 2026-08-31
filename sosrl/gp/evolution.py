@@ -442,7 +442,15 @@ def evolve_architecture_policy(
             raise ValueError("unsupported GP evolution-state schema version.")
         if tuple(state.get("feature_names", ())) != tuple(feature_names):
             raise ValueError("resume state feature registry does not match the requested evolution.")
-        if state["config"] != asdict(config) or state["run_seed"] != int(run_seed):
+        saved_config = dict(state["config"])
+        requested_config = asdict(config)
+        saved_generations = int(saved_config.pop("generations"))
+        requested_generations = int(requested_config.pop("generations"))
+        compatible_extension = (
+            saved_config == requested_config
+            and saved_generations <= requested_generations
+        )
+        if not compatible_extension or state["run_seed"] != int(run_seed):
             raise ValueError("resume state does not match the requested evolution.")
         population = state["population"]
         generation_history = state["generation_history"]

@@ -74,6 +74,8 @@ def _config():
         rule_set="standard",
         gamma=0.99,
         lr=1e-3,
+        lr_end=2.5e-4,
+        lr_decay=0.5,
         batch_size=1,
         buffer_size=10,
         min_buffer_size=1,
@@ -128,6 +130,18 @@ def test_fixed_rule_training_resumes_and_selects_without_architecture_changes():
         assert all(
             int(row["provider_invariant_violations"]) == 0 for row in history
         )
+        assert [float(row["learning_rate"]) for row in history] == [
+            1e-3,
+            5e-4,
+            2.5e-4,
+            2.5e-4,
+        ]
+        assert [float(row["next_learning_rate"]) for row in history] == [
+            5e-4,
+            2.5e-4,
+            2.5e-4,
+            2.5e-4,
+        ]
 
 
 def test_rule_backend_is_frozen_and_single_multi_process_outcomes_match():

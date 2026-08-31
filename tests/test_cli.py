@@ -41,6 +41,8 @@ class UnifiedCliTests(unittest.TestCase):
                 "run-round1-study",
                 "smoke-round1-study",
                 "run-gp-bdqn-alternation",
+                "init-gp-bdqn-tuning",
+                "run-gp-bdqn-tuning",
                 "solve-nsga2",
                 "solve-mopso",
             },
@@ -101,6 +103,18 @@ class UnifiedCliTests(unittest.TestCase):
                 "1",
                 "--workers",
                 "1",
+                "--parent-population-fraction",
+                "0.15",
+                "--crossover-probability",
+                "0.60",
+                "--mutation-probability",
+                "0.35",
+                "--reproduction-probability",
+                "0.05",
+                "--parsimony-coefficient",
+                "0.005",
+                "--validation-candidates-per-run",
+                "5",
             ]
         )
         evaluate = parser.parse_args(
@@ -129,6 +143,12 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(train.feature_set, "system_delta")
         self.assertEqual(train.scheduler_backend, "branching-dqn")
         self.assertEqual(train.anchor_interval, 5)
+        self.assertEqual(train.parent_population_fraction, 0.15)
+        self.assertEqual(train.crossover_probability, 0.60)
+        self.assertEqual(train.mutation_probability, 0.35)
+        self.assertEqual(train.reproduction_probability, 0.05)
+        self.assertEqual(train.parsimony_coefficient, 0.005)
+        self.assertEqual(train.validation_candidates_per_run, 5)
         self.assertEqual(evaluate.baselines, ["fixed", "ss", "gp"])
         self.assertEqual(evaluate.ss_low_threshold, 0.4)
         self.assertEqual(evaluate.ss_high_threshold, 0.9)
@@ -162,10 +182,16 @@ class UnifiedCliTests(unittest.TestCase):
                 "b/validation.json",
                 "--output-dir",
                 "rule-fixed",
+                "--lr-end",
+                "0.00001",
+                "--lr-decay",
+                "0.9975",
             ]
         )
         self.assertEqual(fixed_rule.max_env_steps, 200000)
         self.assertEqual(fixed_rule.seed, 4)
+        self.assertEqual(fixed_rule.lr_end, 0.00001)
+        self.assertEqual(fixed_rule.lr_decay, 0.9975)
 
         round1_scenarios = parser.parse_args(
             ["generate-round1-scenarios", "--output-dir", "round1"]
@@ -295,6 +321,43 @@ class UnifiedCliTests(unittest.TestCase):
         self.assertEqual(alternation.bdqn_max_env_steps, 40000)
         self.assertEqual(alternation.bdqn_round1_seeds, (4, 5, 6))
         self.assertEqual(alternation.bdqn_round2_seeds, (7, 8, 9))
+
+        tuning_init = parser.parse_args(
+            [
+                "init-gp-bdqn-tuning",
+                "--b-scenario-dir",
+                "round1/b",
+                "--g-scenario-dir",
+                "round1/g",
+                "--base-rule-checkpoint",
+                "rule.pt",
+                "--base-gp-policy",
+                "g0.json",
+                "--base-bdqn-checkpoint",
+                "b0_seed1.pt",
+                "--base-bdqn-checkpoint",
+                "b0_seed2.pt",
+                "--base-bdqn-checkpoint",
+                "b0_seed3.pt",
+                "--existing-manifest",
+                "round1/b/train.json",
+                "--output-spec",
+                "tuning_spec.json",
+            ]
+        )
+        tuning_run = parser.parse_args(
+            [
+                "run-gp-bdqn-tuning",
+                "--spec",
+                "tuning_spec.json",
+                "--output-dir",
+                "tuning",
+                "--resume",
+            ]
+        )
+        self.assertEqual(len(tuning_init.base_bdqn_checkpoint), 3)
+        self.assertEqual(tuning_init.existing_manifest, [Path("round1/b/train.json")])
+        self.assertTrue(tuning_run.resume)
         round1_augment = parser.parse_args(
             [
                 "init-round1-study",

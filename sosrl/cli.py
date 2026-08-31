@@ -230,6 +230,8 @@ def add_branching_arguments(parser) -> None:
     parser.add_argument("--refund-rate", type=float, default=0.8)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr-end", type=float)
+    parser.add_argument("--lr-decay", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--buffer-size", type=int, default=50000)
     parser.add_argument("--min-buffer-size", type=int, default=1000)
@@ -266,6 +268,8 @@ def build_parser() -> argparse.ArgumentParser:
     train_fixed_rule.add_argument("--checkpoint-steps", type=int, nargs="+")
     train_fixed_rule.add_argument("--gamma", type=float, default=0.99)
     train_fixed_rule.add_argument("--lr", type=float, default=1e-3)
+    train_fixed_rule.add_argument("--lr-end", type=float)
+    train_fixed_rule.add_argument("--lr-decay", type=float, default=1.0)
     train_fixed_rule.add_argument("--batch-size", type=int, default=64)
     train_fixed_rule.add_argument("--buffer-size", type=int, default=50000)
     train_fixed_rule.add_argument("--min-buffer-size", type=int, default=1000)
@@ -383,6 +387,11 @@ def build_parser() -> argparse.ArgumentParser:
     train_gp.add_argument("--anchor-top-k", type=int, default=10)
     train_gp.add_argument("--parent-gp-policy", type=Path)
     train_gp.add_argument("--parent-population-fraction", type=float, default=0.30)
+    train_gp.add_argument("--crossover-probability", type=float, default=0.75)
+    train_gp.add_argument("--mutation-probability", type=float, default=0.20)
+    train_gp.add_argument("--reproduction-probability", type=float, default=0.05)
+    train_gp.add_argument("--parsimony-coefficient", type=float, default=0.001)
+    train_gp.add_argument("--validation-candidates-per-run", type=int)
     train_gp.add_argument("--convergence-interval", type=int)
     train_gp.add_argument("--convergence-threshold", type=float, default=0.01)
     train_gp.add_argument("--convergence-patience", type=int, default=2)
@@ -522,6 +531,26 @@ def build_parser() -> argparse.ArgumentParser:
     alternate.add_argument("--gp-device", default="cpu")
     alternate.add_argument("--bdqn-device", default="auto")
     alternate.set_defaults(handler=handle_run_gp_bdqn_alternation)
+
+    init_tuning = subparsers.add_parser("init-gp-bdqn-tuning")
+    init_tuning.add_argument("--b-scenario-dir", type=Path, required=True)
+    init_tuning.add_argument("--g-scenario-dir", type=Path, required=True)
+    init_tuning.add_argument("--base-rule-checkpoint", type=Path, required=True)
+    init_tuning.add_argument("--base-gp-policy", type=Path, required=True)
+    init_tuning.add_argument(
+        "--base-bdqn-checkpoint", type=Path, action="append", required=True
+    )
+    init_tuning.add_argument("--existing-manifest", type=Path, action="append")
+    init_tuning.add_argument("--output-spec", type=Path, required=True)
+    init_tuning.set_defaults(handler=handle_init_gp_bdqn_tuning)
+
+    run_tuning = subparsers.add_parser("run-gp-bdqn-tuning")
+    run_tuning.add_argument("--spec", type=Path, required=True)
+    run_tuning.add_argument("--output-dir", type=Path, required=True)
+    run_tuning.add_argument("--rule-device", default="auto")
+    run_tuning.add_argument("--bdqn-device", default="auto")
+    run_tuning.add_argument("--resume", action="store_true")
+    run_tuning.set_defaults(handler=handle_run_gp_bdqn_tuning)
 
     round1_cell = subparsers.add_parser("train-round1-bdqn-cell")
     round1_cell.add_argument(
@@ -768,6 +797,8 @@ def branching_config(args) -> BranchingDQNConfig:
         refund_rate=args.refund_rate,
         gamma=args.gamma,
         lr=args.lr,
+        lr_end=args.lr_end,
+        lr_decay=args.lr_decay,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         min_buffer_size=args.min_buffer_size,
@@ -1403,6 +1434,8 @@ def handle_train_fixed_rule_scheduler(args) -> None:
         cost_limit=8000.0,
         gamma=args.gamma,
         lr=args.lr,
+        lr_end=args.lr_end,
+        lr_decay=args.lr_decay,
         batch_size=args.batch_size,
         buffer_size=args.buffer_size,
         min_buffer_size=args.min_buffer_size,
@@ -1502,6 +1535,10 @@ def handle_train_gp_architecture(args) -> None:
         convergence_confirmation_windows=args.convergence_confirmation_windows,
         min_generations=min(args.min_generations, args.generations),
         parent_population_fraction=args.parent_population_fraction,
+        crossover_probability=args.crossover_probability,
+        mutation_probability=args.mutation_probability,
+        reproduction_probability=args.reproduction_probability,
+        parsimony_coefficient=args.parsimony_coefficient,
         workers=args.workers,
         base_seed=args.base_seed,
         feature_set=args.feature_set,
@@ -1516,6 +1553,7 @@ def handle_train_gp_architecture(args) -> None:
         resume_state=args.resume_state,
         parent_gp_policy=args.parent_gp_policy,
         skip_test_evaluation=args.skip_test_evaluation,
+        validation_candidates_per_run=args.validation_candidates_per_run,
     )
     print_json({name: str(path.resolve()) for name, path in outputs.items()})
 
@@ -1628,6 +1666,39 @@ def handle_run_gp_bdqn_alternation(args) -> None:
         bdqn_round2_seeds=args.bdqn_round2_seeds,
         bdqn_parallel_jobs=args.bdqn_parallel_jobs,
         gp_device=resolve_device(args.gp_device),
+        bdqn_device=(
+            "auto" if args.bdqn_device == "auto" else resolve_device(args.bdqn_device)
+        ),
+    )
+    print_json({name: str(path.resolve()) for name, path in outputs.items()})
+
+
+def handle_init_gp_bdqn_tuning(args) -> None:
+    from .workflows.gp_bdqn_tuning import create_gp_bdqn_tuning_spec
+
+    output = create_gp_bdqn_tuning_spec(
+        args.output_spec,
+        b_scenario_dir=args.b_scenario_dir,
+        g_scenario_dir=args.g_scenario_dir,
+        base_rule_checkpoint=args.base_rule_checkpoint,
+        base_gp_policy=args.base_gp_policy,
+        base_bdqn_checkpoints=args.base_bdqn_checkpoint,
+        existing_manifests=tuple(args.existing_manifest or ()),
+    )
+    print_json({"spec": str(output.resolve())})
+
+
+def handle_run_gp_bdqn_tuning(args) -> None:
+    from .workflows.gp_bdqn_tuning import run_gp_bdqn_tuning
+
+    # The workflow is intrinsically resumable.  --resume is accepted as an
+    # explicit audit flag while rerunning the same command is also safe.
+    outputs = run_gp_bdqn_tuning(
+        spec_path=args.spec,
+        output_dir=args.output_dir,
+        rule_device=(
+            "auto" if args.rule_device == "auto" else resolve_device(args.rule_device)
+        ),
         bdqn_device=(
             "auto" if args.bdqn_device == "auto" else resolve_device(args.bdqn_device)
         ),

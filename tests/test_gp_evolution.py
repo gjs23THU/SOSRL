@@ -271,6 +271,74 @@ class GPEvolutionTest(unittest.TestCase):
         self.assertEqual(resumed.generation_history, full.generation_history)
         self.assertEqual(resumed.anchor_history, full.anchor_history)
 
+    def test_screen_checkpoint_can_extend_generation_limit(self):
+        names = feature_names_for_preset("system")
+        scenarios = [0, 1, 2, 3]
+        common = {
+            "population_size": 8,
+            "independent_runs": 1,
+            "elite_count": 1,
+            "train_batch_size": 4,
+            "anchor_size": 4,
+            "anchor_interval": 1,
+            "anchor_top_k": 2,
+            "min_generations": 1,
+        }
+
+        def evaluator(individual, selected):
+            value = (sum(ord(char) for char in str(individual)) % 17) / 100.0
+            return [
+                EpisodeOutcome(
+                    success=True,
+                    completed_operations=4,
+                    total_operations=4,
+                    makespan=100.0 + value + item,
+                    scale=200.0,
+                    final_net_cost=4000.0,
+                    peak_net_cost=4000.0,
+                    budget=8000.0,
+                    architecture_changes=0,
+                )
+                for item in selected
+            ]
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            checkpoint = root / "screen.pkl"
+            screened = evolve_architecture_policy(
+                feature_names=names,
+                config=GPArchitectureConfig(generations=1, **common),
+                run_seed=123,
+                batch_sampler=lambda seed, generation: scenarios,
+                anchor_scenarios=scenarios,
+                individual_evaluator=evaluator,
+                checkpoint_path=checkpoint,
+            )
+            resumed = evolve_architecture_policy(
+                feature_names=names,
+                config=GPArchitectureConfig(generations=2, **common),
+                run_seed=123,
+                batch_sampler=lambda seed, generation: scenarios,
+                anchor_scenarios=scenarios,
+                individual_evaluator=evaluator,
+                checkpoint_path=checkpoint,
+                resume_state=checkpoint,
+            )
+            uninterrupted = evolve_architecture_policy(
+                feature_names=names,
+                config=GPArchitectureConfig(generations=2, **common),
+                run_seed=123,
+                batch_sampler=lambda seed, generation: scenarios,
+                anchor_scenarios=scenarios,
+                individual_evaluator=evaluator,
+                checkpoint_path=root / "full.pkl",
+            )
+
+        self.assertEqual(screened.actual_generations, 1)
+        self.assertEqual(resumed.actual_generations, 2)
+        self.assertEqual(resumed.generation_history, uninterrupted.generation_history)
+        self.assertEqual(resumed.anchor_history, uninterrupted.anchor_history)
+
 
 if __name__ == "__main__":
     unittest.main()

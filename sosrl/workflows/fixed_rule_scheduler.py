@@ -390,6 +390,8 @@ def train_fixed_rule_scheduler(
             scheduling_rules.Rule.RULE_NUM,
             config,
         )
+        manifest["initial_parameter_sha256"] = scheduler_parameter_hash(agent)
+        _write_json(manifest_path, manifest)
         zero_path = checkpoints_dir / "checkpoint_0.pt"
         _save_checkpoint_atomic(
             agent,
@@ -418,11 +420,26 @@ def train_fixed_rule_scheduler(
             history=history,
         )
 
+    # Older partial runs did not persist the learning-rate trace.  Backfill it
+    # deterministically so resume and uninterrupted histories have one schema.
+    for row in history:
+        row_episode = int(row["episode"])
+        row.setdefault(
+            "learning_rate", config.learning_rate_at_episode(row_episode)
+        )
+        row.setdefault(
+            "next_learning_rate",
+            config.learning_rate_at_episode(row_episode + 1),
+        )
+
     provider = FixedArchitectureProvider()
     while total_steps < steps[-1]:
         payload = sampler.next_payload()
         mission_env = _scenario_environment(payload, "fixed")
         used_epsilon = float(epsilon)
+        used_learning_rate = config.learning_rate_at_episode(episode)
+        for parameter_group in agent.optimizer.param_groups:
+            parameter_group["lr"] = used_learning_rate
         result = run_rule_dqn_episode(
             mission_env,
             provider,
@@ -446,6 +463,10 @@ def train_fixed_rule_scheduler(
                 "provider": "fixed",
                 "seed": int(config.seed),
                 "next_epsilon": float(epsilon),
+                "learning_rate": float(used_learning_rate),
+                "next_learning_rate": float(
+                    config.learning_rate_at_episode(episode + 1)
+                ),
                 "replay_size": len(agent.replay),
             }
         )
@@ -465,6 +486,10 @@ def train_fixed_rule_scheduler(
                     "actual_environment_steps": int(total_steps),
                     "episodes": int(episode),
                     "epsilon": float(epsilon),
+                    "learning_rate": float(used_learning_rate),
+                    "next_learning_rate": float(
+                        config.learning_rate_at_episode(episode)
+                    ),
                     "seed": int(config.seed),
                     "provider_sha256": "static-feasible-keep-v1",
                     "train_manifest_hash": train["manifest_hash"],
@@ -537,7 +562,6 @@ def train_fixed_rule_scheduler(
         valid_summaries,
         key=lambda row: (
             float(row["failure_rate"]),
-            float(row["mean_j"]),
             float(row["mean_success_makespan"]),
             int(row["target_environment_steps"]),
         ),
@@ -546,8 +570,8 @@ def train_fixed_rule_scheduler(
     selected_checkpoint = checkpoint_paths[selected_step].resolve()
     selection = {
         "selection_rule": (
-            "minimize failure_rate, then mean_j, then mean_success_makespan, "
-            "then target_environment_steps"
+            "minimize failure_rate, then mean_success_makespan, then "
+            "target_environment_steps; mean_j is reporting-only"
         ),
         "selected_step": selected_step,
         "checkpoint": str(selected_checkpoint),

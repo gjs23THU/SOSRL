@@ -740,6 +740,7 @@ def train_gp_architecture(
     resume_state: str | Path | None = None,
     parent_gp_policy: str | Path | None = None,
     skip_test_evaluation: bool = False,
+    validation_candidates_per_run: int | None = None,
 ) -> dict[str, Path]:
     """Evolve independent runs, validate all candidates, and lock one JSON rule."""
     if config.workers > 1 and torch.device(device).type != "cpu":
@@ -870,7 +871,46 @@ def train_gp_architecture(
             )
 
         evaluator.outcome_cache.clear()
-        expressions = sorted({row["expression"] for row in candidate_rows})
+        if validation_candidates_per_run is None:
+            expressions = sorted({row["expression"] for row in candidate_rows})
+        else:
+            if int(validation_candidates_per_run) <= 0:
+                raise ValueError("validation_candidates_per_run must be positive.")
+            selected_expressions: set[str] = set()
+            for run_seed in sorted({int(row["run_seed"]) for row in candidate_rows}):
+                run_rows = [
+                    row for row in candidate_rows if int(row["run_seed"]) == run_seed
+                ]
+                ranked = sorted(
+                    run_rows,
+                    key=lambda row: (
+                        float(row["failure_rate"]),
+                        float(row["regularized_j"]),
+                        int(row["node_count"]),
+                        int(row["height"]),
+                        str(row["expression"]),
+                    ),
+                )
+                # Validate the run champion plus the best distinct anchor
+                # policies.  Fall back to other archived policies only when a
+                # short smoke run did not reach an anchor boundary.
+                ordered_rows = [ranked[0]]
+                ordered_rows.extend(
+                    row for row in ranked if str(row.get("source")) == "anchor"
+                )
+                ordered_rows.extend(ranked)
+                distinct = []
+                seen = set()
+                for row in ordered_rows:
+                    expression = str(row["expression"])
+                    if expression in seen:
+                        continue
+                    seen.add(expression)
+                    distinct.append(expression)
+                    if len(distinct) >= int(validation_candidates_per_run):
+                        break
+                selected_expressions.update(distinct)
+            expressions = sorted(selected_expressions)
         validation_rows = []
         pset = build_primitive_set(feature_names_for_preset(config.feature_set))
         individuals = {
@@ -1040,6 +1080,7 @@ def train_gp_architecture(
             else {"path": str(parent_path), "sha256": parent_policy_hash}
         ),
         "skip_test_evaluation": bool(skip_test_evaluation),
+        "validation_candidates_per_run": validation_candidates_per_run,
         "run_convergence": run_convergence,
     }
     if scheduler_backend == "branching-dqn":
