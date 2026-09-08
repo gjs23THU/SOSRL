@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from collections import deque
+import math
 import random
 from typing import NamedTuple, Sequence
 
@@ -165,6 +166,7 @@ class BranchingQOutput(NamedTuple):
     value: torch.Tensor
     task_advantages: torch.Tensor
     system_advantages: torch.Tensor
+    interaction: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -449,10 +451,13 @@ def masked_argmax(scores: np.ndarray, pair_mask: np.ndarray) -> tuple[int, int]:
 
 
 class BranchingQNetwork(nn.Module):
-    """Entity encoders and additive dueling heads for variable T/N."""
+    """Entity encoders and optional pairwise interaction for variable T/N."""
 
-    def __init__(self):
+    def __init__(self, interaction_rank: int = 0):
         super().__init__()
+        self.interaction_rank = int(interaction_rank)
+        if self.interaction_rank < 0:
+            raise ValueError("interaction_rank must be non-negative.")
         self.task_encoder = nn.Sequential(
             nn.Linear(TASK_FEATURE_DIM, 128),
             nn.ReLU(),
@@ -492,6 +497,17 @@ class BranchingQNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 1),
         )
+        if self.interaction_rank:
+            self.task_interaction_head = nn.Linear(192, self.interaction_rank)
+            self.system_interaction_head = nn.Linear(192, self.interaction_rank)
+            # An additive checkpoint can therefore warm-start this model with
+            # exactly identical scores while the non-zero task projection lets
+            # gradients start flowing into the system projection immediately.
+            nn.init.zeros_(self.system_interaction_head.weight)
+            nn.init.zeros_(self.system_interaction_head.bias)
+        else:
+            self.task_interaction_head = None
+            self.system_interaction_head = None
 
     @staticmethod
     def _masked_pool(
@@ -518,6 +534,30 @@ class BranchingQNetwork(nn.Module):
         )
         centered = advantages - mean
         return torch.where(mask, centered, torch.zeros_like(centered))
+
+    def _pairwise_interaction(
+        self,
+        task_inputs: torch.Tensor,
+        system_inputs: torch.Tensor,
+        pair_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        shape = (
+            task_inputs.shape[0],
+            task_inputs.shape[1],
+            system_inputs.shape[1],
+        )
+        if not self.interaction_rank:
+            return task_inputs.new_zeros(shape)
+        task_factors = self.task_interaction_head(task_inputs)
+        system_factors = self.system_interaction_head(system_inputs)
+        raw = torch.einsum("btr,bsr->bts", task_factors, system_factors)
+        raw = raw / math.sqrt(float(self.interaction_rank))
+        mask_float = pair_mask.to(raw.dtype)
+        mean = (raw * mask_float).flatten(1).sum(dim=1) / (
+            mask_float.flatten(1).sum(dim=1).clamp_min(1.0)
+        )
+        centered = raw - mean[:, None, None]
+        return torch.where(pair_mask, centered, torch.zeros_like(centered))
 
     def forward(
         self,
@@ -557,12 +597,10 @@ class BranchingQNetwork(nn.Module):
             system_embeddings.shape[1],
             -1,
         )
-        raw_task_advantages = self.task_advantage_head(
-            torch.cat([task_embeddings, task_context], dim=-1)
-        ).squeeze(-1)
-        raw_system_advantages = self.system_advantage_head(
-            torch.cat([system_embeddings, system_context], dim=-1)
-        ).squeeze(-1)
+        task_inputs = torch.cat([task_embeddings, task_context], dim=-1)
+        system_inputs = torch.cat([system_embeddings, system_context], dim=-1)
+        raw_task_advantages = self.task_advantage_head(task_inputs).squeeze(-1)
+        raw_system_advantages = self.system_advantage_head(system_inputs).squeeze(-1)
         valid_tasks = pair_mask.any(dim=2) & task_entity_mask
         valid_systems = pair_mask.any(dim=1) & system_entity_mask
         task_advantages = self._center_advantages(
@@ -574,16 +612,23 @@ class BranchingQNetwork(nn.Module):
             valid_systems,
         )
         value = self.value_head(context)
+        interaction = self._pairwise_interaction(
+            task_inputs,
+            system_inputs,
+            pair_mask,
+        )
         scores = (
             value.unsqueeze(2)
             + task_advantages.unsqueeze(2)
             + system_advantages.unsqueeze(1)
+            + interaction
         )
         return BranchingQOutput(
             scores=scores,
             value=value,
             task_advantages=task_advantages,
             system_advantages=system_advantages,
+            interaction=interaction,
         )
 
 
@@ -622,20 +667,35 @@ class BranchingReplayBuffer:
 
 
 class BranchingDQNAgent:
-    """Double DQN over an additive, pair-masked task-system value function."""
+    """Double DQN over a pair-masked task-system value function."""
 
     checkpoint_kind = "branching_scheduler"
 
     def __init__(self, config: BranchingDQNConfig):
         self.config = config
         self.device = torch.device(config.device)
-        self.q_net = BranchingQNetwork().to(self.device)
-        self.target_net = BranchingQNetwork().to(self.device)
+        interaction_rank = int(config.pairwise_interaction_rank)
+        self.q_net = BranchingQNetwork(interaction_rank).to(self.device)
+        self.target_net = BranchingQNetwork(interaction_rank).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=config.lr)
         self.replay = BranchingReplayBuffer(config.buffer_size)
         self.learn_step = 0
+        self.pairwise_residual_only = False
+
+    def set_pairwise_residual_only(self, enabled: bool) -> None:
+        """Freeze or unfreeze the additive model around the interaction heads."""
+
+        enabled = bool(enabled)
+        if enabled and not int(self.config.pairwise_interaction_rank):
+            raise ValueError("residual-only training requires a pairwise interaction.")
+        for name, parameter in self.q_net.named_parameters():
+            is_interaction = name.startswith(
+                ("task_interaction_head.", "system_interaction_head.")
+            )
+            parameter.requires_grad_(is_interaction if enabled else True)
+        self.pairwise_residual_only = enabled
 
     def save_checkpoint(self, path, training_state=None):
         from .checkpoint import save_branching_checkpoint

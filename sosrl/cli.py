@@ -239,6 +239,8 @@ def add_branching_arguments(parser) -> None:
     parser.add_argument("--epsilon-start", type=float, default=1.0)
     parser.add_argument("--epsilon-end", type=float, default=0.05)
     parser.add_argument("--epsilon-decay", type=float, default=0.995)
+    parser.add_argument("--pairwise-interaction-rank", type=int, default=0)
+    parser.add_argument("--pairwise-residual-warmup-steps", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--log-interval", type=int, default=10)
     parser.add_argument(
@@ -451,10 +453,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--checkpoint-interval-steps", type=int, default=10000
     )
     finetune_branching_gp.add_argument("--lr", type=float, default=1e-5)
+    finetune_branching_gp.add_argument("--lr-end", type=float)
+    finetune_branching_gp.add_argument("--lr-decay", type=float, default=1.0)
     finetune_branching_gp.add_argument("--epsilon-start", type=float, default=0.10)
     finetune_branching_gp.add_argument("--epsilon-end", type=float, default=0.02)
     finetune_branching_gp.add_argument(
         "--epsilon-decay", type=float, default=0.995
+    )
+    finetune_branching_gp.add_argument(
+        "--pairwise-interaction-rank", type=int, default=0
+    )
+    finetune_branching_gp.add_argument(
+        "--pairwise-residual-warmup-steps", type=int, default=0
     )
     finetune_branching_gp.add_argument("--seed", type=int, default=4)
     finetune_branching_gp.add_argument("--device", default="auto")
@@ -806,6 +816,8 @@ def branching_config(args) -> BranchingDQNConfig:
         epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
         epsilon_decay=args.epsilon_decay,
+        pairwise_interaction_rank=args.pairwise_interaction_rank,
+        pairwise_residual_warmup_steps=args.pairwise_residual_warmup_steps,
         seed=args.seed,
         device=resolve_device(args.device),
         log_interval=args.log_interval,
@@ -1593,9 +1605,13 @@ def handle_finetune_branching_with_gp(args) -> None:
         extra_env_steps=args.extra_env_steps,
         checkpoint_interval_steps=args.checkpoint_interval_steps,
         lr=args.lr,
+        lr_end=args.lr_end,
+        lr_decay=args.lr_decay,
         epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
         epsilon_decay=args.epsilon_decay,
+        pairwise_interaction_rank=args.pairwise_interaction_rank,
+        pairwise_residual_warmup_steps=args.pairwise_residual_warmup_steps,
         seed=args.seed,
         device=args.device,
         resume=args.resume,

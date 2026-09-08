@@ -100,6 +100,43 @@ class BranchingGPFinetuneUnitTest(unittest.TestCase):
             )
         )
 
+    def test_prepare_agent_adds_zero_initialized_pairwise_term(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            checkpoint_path = Path(temp_dir) / "b0.pt"
+            base = BranchingDQNAgent(BranchingDQNConfig(device="cpu"))
+            base.save_checkpoint(checkpoint_path)
+            adapted, _ = prepare_finetune_agent(
+                checkpoint_path,
+                BranchingDQNConfig(
+                    device="cpu",
+                    pairwise_interaction_rank=8,
+                ),
+            )
+            inputs = {
+                "global_features": torch.randn(2, 25),
+                "task_features": torch.randn(2, 3, 15),
+                "system_features": torch.randn(2, 4, 16),
+                "task_entity_mask": torch.ones(2, 3, dtype=torch.bool),
+                "system_entity_mask": torch.ones(2, 4, dtype=torch.bool),
+                "pair_mask": torch.ones(2, 3, 4, dtype=torch.bool),
+            }
+            with torch.no_grad():
+                base_scores = base.q_net(**inputs).scores
+                adapted_scores = adapted.q_net(**inputs).scores
+
+        self.assertEqual(adapted.config.pairwise_interaction_rank, 8)
+        self.assertTrue(torch.equal(base_scores, adapted_scores))
+        self.assertEqual(len(adapted.replay), 0)
+        self.assertEqual(adapted.optimizer.state, {})
+        for name, value in base.q_net.state_dict().items():
+            self.assertTrue(torch.equal(value, adapted.q_net.state_dict()[name]), name)
+        self.assertTrue(
+            torch.equal(
+                adapted.q_net.system_interaction_head.weight,
+                torch.zeros_like(adapted.q_net.system_interaction_head.weight),
+            )
+        )
+
     def test_initialize_run_directory_never_overwrites(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             destination = Path(temp_dir) / "run"
@@ -296,6 +333,11 @@ class BranchingGPFinetuneIntegrationTest(unittest.TestCase):
                 output_dir=output_dir,
                 extra_env_steps=8,
                 checkpoint_interval_steps=2,
+                lr=1e-4,
+                lr_end=1e-5,
+                lr_decay=0.9975,
+                pairwise_interaction_rank=8,
+                pairwise_residual_warmup_steps=4,
                 seed=4,
                 device="cpu",
                 skip_historical_test=True,
@@ -342,6 +384,15 @@ class BranchingGPFinetuneIntegrationTest(unittest.TestCase):
             ) as file:
                 history = list(csv.DictReader(file))
             self.assertEqual(len(history), 8)
+            self.assertEqual(
+                [row["pairwise_residual_only"] for row in history],
+                ["True"] * 4 + ["False"] * 4,
+            )
+            self.assertAlmostEqual(float(history[0]["learning_rate"]), 1e-4)
+            self.assertAlmostEqual(
+                float(history[0]["next_learning_rate"]),
+                1e-4 * 0.9975,
+            )
             self.assertEqual(
                 {category: sum(row["category"] == category for row in history)
                  for category in self.categories},

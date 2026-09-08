@@ -93,7 +93,7 @@ class IntDQNConfig:
 
 @dataclass
 class BranchingDQNConfig:
-    """Training configuration for the constrained additive branching scheduler."""
+    """Training configuration for the constrained branching scheduler."""
 
     episodes: int = 2000
     max_env_steps: int | None = 240000
@@ -111,9 +111,25 @@ class BranchingDQNConfig:
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
     epsilon_decay: float = 0.995
+    pairwise_interaction_rank: int = 0
+    pairwise_residual_warmup_steps: int = 0
     seed: int = 1
     device: str = default_device()
     log_interval: int = 10
+
+    def __post_init__(self) -> None:
+        self.pairwise_interaction_rank = int(self.pairwise_interaction_rank)
+        if self.pairwise_interaction_rank < 0:
+            raise ValueError("pairwise_interaction_rank must be non-negative.")
+        self.pairwise_residual_warmup_steps = int(
+            self.pairwise_residual_warmup_steps
+        )
+        if self.pairwise_residual_warmup_steps < 0:
+            raise ValueError("pairwise_residual_warmup_steps must be non-negative.")
+        if self.pairwise_residual_warmup_steps and not self.pairwise_interaction_rank:
+            raise ValueError(
+                "pairwise_residual_warmup_steps requires a positive interaction rank."
+            )
 
     def learning_rate_at_episode(self, episode: int) -> float:
         """Return the exponentially decayed learning rate for one episode."""

@@ -25,6 +25,7 @@ from sosrl.rl.config import BranchingDQNConfig
 from sosrl.rl.agent import ArchitectureDQNAgent, DQNAgent
 from sosrl.rl.config import DQNConfig, HRLConfig
 from sosrl.rl.checkpoint import (
+    load_branching_checkpoint,
     load_combined_checkpoint,
     save_combined_checkpoint,
 )
@@ -141,6 +142,136 @@ class BranchingBatchTests(unittest.TestCase):
         self.assertEqual(output.scores.shape, (2, 4, 3))
         self.assertEqual(output.value.shape, (2, 1))
         self.assertTrue(torch.isfinite(output.scores).all())
+        self.assertTrue(torch.equal(output.interaction, torch.zeros_like(output.scores)))
+
+    def test_pairwise_interaction_is_centered_over_legal_pairs(self):
+        network = BranchingQNetwork(interaction_rank=2)
+        with torch.no_grad():
+            network.task_interaction_head.weight.zero_()
+            network.task_interaction_head.bias.zero_()
+            network.system_interaction_head.weight.zero_()
+            network.system_interaction_head.bias.zero_()
+            network.task_interaction_head.weight[0, 0] = 1.0
+            network.system_interaction_head.weight[0, 0] = 1.0
+        task_inputs = torch.zeros((1, 2, 192))
+        system_inputs = torch.zeros((1, 3, 192))
+        task_inputs[0, :, 0] = torch.tensor([1.0, 3.0])
+        system_inputs[0, :, 0] = torch.tensor([2.0, 4.0, 5.0])
+        pair_mask = torch.tensor(
+            [[[True, False, True], [False, True, False]]],
+            dtype=torch.bool,
+        )
+
+        interaction = network._pairwise_interaction(
+            task_inputs,
+            system_inputs,
+            pair_mask,
+        )
+
+        self.assertAlmostEqual(
+            float(interaction[pair_mask].sum().detach()),
+            0.0,
+            places=6,
+        )
+        self.assertTrue(torch.equal(interaction[~pair_mask], torch.zeros(3)))
+        self.assertGreater(float(interaction.abs().max().detach()), 0.0)
+
+    def test_pairwise_zero_initialization_preserves_additive_scores_and_learns(self):
+        torch.manual_seed(7)
+        additive = BranchingQNetwork(interaction_rank=0)
+        pairwise = BranchingQNetwork(interaction_rank=8)
+        incompatible = pairwise.load_state_dict(additive.state_dict(), strict=False)
+        self.assertEqual(
+            set(incompatible.missing_keys),
+            {
+                "task_interaction_head.weight",
+                "task_interaction_head.bias",
+                "system_interaction_head.weight",
+                "system_interaction_head.bias",
+            },
+        )
+        batch = collate_branching_observations([self.observation(2, 3)])
+        batch.task_features[0, 1] *= 2.0
+        batch.system_features[0, 1] *= 3.0
+        batch.pair_mask[0, 1, 1] = True
+        tensors = batch.to_torch(torch.device("cpu"))
+
+        additive_output = additive(**tensors)
+        pairwise_output = pairwise(**tensors)
+
+        self.assertTrue(torch.equal(additive_output.scores, pairwise_output.scores))
+        self.assertTrue(
+            torch.equal(pairwise_output.interaction, torch.zeros_like(pairwise_output.scores))
+        )
+        optimizer = torch.optim.Adam(pairwise.parameters(), lr=1e-3)
+        loss = (pairwise_output.scores[0, 0, 0] - 1.0).square()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        self.assertGreater(
+            float(pairwise.system_interaction_head.weight.detach().abs().sum()),
+            0.0,
+        )
+
+    def test_pairwise_config_rejects_negative_rank(self):
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            BranchingDQNConfig(pairwise_interaction_rank=-1)
+        with self.assertRaisesRegex(ValueError, "positive interaction rank"):
+            BranchingDQNConfig(pairwise_residual_warmup_steps=5000)
+
+    def test_residual_only_mode_freezes_everything_except_interaction_heads(self):
+        agent = BranchingDQNAgent(
+            BranchingDQNConfig(device="cpu", pairwise_interaction_rank=8)
+        )
+
+        agent.set_pairwise_residual_only(True)
+
+        for name, parameter in agent.q_net.named_parameters():
+            expected = name.startswith(
+                ("task_interaction_head.", "system_interaction_head.")
+            )
+            self.assertEqual(parameter.requires_grad, expected, name)
+        agent.set_pairwise_residual_only(False)
+        self.assertTrue(all(p.requires_grad for p in agent.q_net.parameters()))
+
+    def test_legacy_additive_checkpoint_defaults_to_rank_zero(self):
+        observation = self.observation(2, 3)
+        batch = collate_branching_observations([observation])
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "legacy.pt"
+            original = BranchingDQNAgent(BranchingDQNConfig(device="cpu"))
+            original.save_checkpoint(path)
+            payload = torch.load(path, map_location="cpu", weights_only=True)
+            payload["config"].pop("pairwise_interaction_rank")
+            payload["config"].pop("pairwise_residual_warmup_steps")
+            payload["network_config"].pop("pairwise_interaction_rank")
+            payload["network_config"].pop("pairwise_interaction_heads")
+            torch.save(payload, path)
+
+            loaded, _ = load_branching_checkpoint(path, device="cpu")
+
+        self.assertEqual(loaded.config.pairwise_interaction_rank, 0)
+        with torch.no_grad():
+            expected = original.q_net(**batch.to_torch(torch.device("cpu"))).scores
+            actual = loaded.q_net(**batch.to_torch(torch.device("cpu"))).scores
+        self.assertTrue(torch.equal(expected, actual))
+
+    def test_pairwise_checkpoint_round_trip(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "pairwise.pt"
+            original = BranchingDQNAgent(
+                BranchingDQNConfig(device="cpu", pairwise_interaction_rank=8)
+            )
+            original.save_checkpoint(path)
+            loaded, checkpoint = load_branching_checkpoint(path, device="cpu")
+
+        self.assertEqual(loaded.config.pairwise_interaction_rank, 8)
+        self.assertEqual(
+            checkpoint["network_config"]["joint_value"],
+            "V+A_task+A_system+I_task_system",
+        )
+        for name, value in original.q_net.state_dict().items():
+            self.assertTrue(torch.equal(value, loaded.q_net.state_dict()[name]), name)
 
 
 class BranchingActionSelectionTests(unittest.TestCase):

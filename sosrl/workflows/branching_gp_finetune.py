@@ -125,8 +125,32 @@ def prepare_finetune_agent(
         load_optimizer=False,
     )
     agent = BranchingDQNAgent(config)
-    agent.q_net.load_state_dict(source_agent.q_net.state_dict())
-    agent.target_net.load_state_dict(source_agent.target_net.state_dict())
+    source_rank = int(source_agent.config.pairwise_interaction_rank)
+    target_rank = int(config.pairwise_interaction_rank)
+
+    def warm_start(destination, source) -> None:
+        if source_rank == target_rank:
+            destination.load_state_dict(source.state_dict())
+            return
+        if source_rank != 0 or target_rank <= 0:
+            raise ValueError(
+                "warm start only supports equal interaction ranks or additive-to-pairwise."
+            )
+        incompatible = destination.load_state_dict(source.state_dict(), strict=False)
+        missing = set(incompatible.missing_keys)
+        expected = {
+            "task_interaction_head.weight",
+            "task_interaction_head.bias",
+            "system_interaction_head.weight",
+            "system_interaction_head.bias",
+        }
+        if missing != expected or incompatible.unexpected_keys:
+            raise RuntimeError(
+                "unexpected parameter mismatch while adding pairwise interaction."
+            )
+
+    warm_start(agent.q_net, source_agent.q_net)
+    warm_start(agent.target_net, source_agent.target_net)
     agent.learn_step = int(source_agent.learn_step)
     agent.q_net.train()
     agent.target_net.eval()
@@ -681,9 +705,13 @@ def _training_config(
     *,
     extra_env_steps: int,
     lr: float,
+    lr_end: float | None,
+    lr_decay: float,
     epsilon_start: float,
     epsilon_end: float,
     epsilon_decay: float,
+    pairwise_interaction_rank: int,
+    pairwise_residual_warmup_steps: int,
     seed: int,
     device: str,
 ) -> BranchingDQNConfig:
@@ -695,6 +723,8 @@ def _training_config(
         refund_rate=0.8,
         gamma=0.99,
         lr=float(lr),
+        lr_end=None if lr_end is None else float(lr_end),
+        lr_decay=float(lr_decay),
         batch_size=64,
         buffer_size=50000,
         min_buffer_size=1000,
@@ -702,6 +732,8 @@ def _training_config(
         epsilon_start=float(epsilon_start),
         epsilon_end=float(epsilon_end),
         epsilon_decay=float(epsilon_decay),
+        pairwise_interaction_rank=int(pairwise_interaction_rank),
+        pairwise_residual_warmup_steps=int(pairwise_residual_warmup_steps),
         seed=int(seed),
         device=str(device),
         log_interval=10,
@@ -834,6 +866,14 @@ def train_finetuned_scheduler(
         payload = sampler.next_payload()
         mission_env = _scenario_environment(payload)
         used_epsilon = float(epsilon)
+        used_lr = float(config.learning_rate_at_episode(episode))
+        for parameter_group in agent.optimizer.param_groups:
+            parameter_group["lr"] = used_lr
+        residual_only = bool(
+            config.pairwise_residual_warmup_steps
+            and total_steps < config.pairwise_residual_warmup_steps
+        )
+        agent.set_pairwise_residual_only(residual_only)
         # The first 1,000 new transitions are collection-only.  Requiring
         # 1,001 entries here makes transition number 1,000 ineligible while
         # preserving the registered steady-state min replay value of 1,000.
@@ -853,6 +893,7 @@ def train_finetuned_scheduler(
         agent.config.min_buffer_size = registered_min_replay
         total_steps += int(result["assignment_steps"])
         epsilon = max(config.epsilon_end, epsilon * config.epsilon_decay)
+        next_lr = float(config.learning_rate_at_episode(episode + 1))
         row = branching_episode_row(
             episode,
             payload["category"],
@@ -865,6 +906,9 @@ def train_finetuned_scheduler(
             {
                 "scenario_hash": payload["scenario_hash"],
                 "next_epsilon": float(epsilon),
+                "learning_rate": used_lr,
+                "next_learning_rate": next_lr,
+                "pairwise_residual_only": residual_only,
                 "replay_size": len(agent.replay),
                 "learning_enabled": len(agent.replay) > registered_min_replay,
             }
@@ -882,6 +926,8 @@ def train_finetuned_scheduler(
                 "actual_environment_steps": int(total_steps),
                 "episodes": int(episode),
                 "epsilon": float(epsilon),
+                "next_learning_rate": next_lr,
+                "pairwise_residual_only": bool(agent.pairwise_residual_only),
                 "base_scheduler_sha256": input_records["b0_scheduler"]["sha256"],
                 "g0_policy_sha256": input_records["g0_policy"]["sha256"],
                 "train_manifest_sha256": input_records["train_manifest"]["sha256"],
@@ -899,6 +945,10 @@ def train_finetuned_scheduler(
         "episodes": int(episode),
         "actual_environment_steps": int(total_steps),
         "epsilon": float(epsilon),
+        "next_learning_rate": float(config.learning_rate_at_episode(episode)),
+        "pairwise_residual_warmup_steps": int(
+            config.pairwise_residual_warmup_steps
+        ),
         "replay_reinitialized_on_resume": bool(replay_reinitialized),
         "resumed_from": str(resumed_from) if resumed_from else None,
     }
@@ -1148,9 +1198,13 @@ def finetune_branching_with_frozen_gp(
     extra_env_steps: int = 40000,
     checkpoint_interval_steps: int = 10000,
     lr: float = 1e-5,
+    lr_end: float | None = None,
+    lr_decay: float = 1.0,
     epsilon_start: float = 0.10,
     epsilon_end: float = 0.02,
     epsilon_decay: float = 0.995,
+    pairwise_interaction_rank: int = 0,
+    pairwise_residual_warmup_steps: int = 0,
     seed: int = 4,
     device: str = "auto",
     resume: bool = False,
@@ -1174,9 +1228,15 @@ def finetune_branching_with_frozen_gp(
         "extra_env_steps": int(extra_env_steps),
         "checkpoint_interval_steps": int(checkpoint_interval_steps),
         "lr": float(lr),
+        "lr_end": None if lr_end is None else float(lr_end),
+        "lr_decay": float(lr_decay),
         "epsilon_start": float(epsilon_start),
         "epsilon_end": float(epsilon_end),
         "epsilon_decay": float(epsilon_decay),
+        "pairwise_interaction_rank": int(pairwise_interaction_rank),
+        "pairwise_residual_warmup_steps": int(
+            pairwise_residual_warmup_steps
+        ),
         "seed": int(seed),
         "device": resolved_device,
         "skip_historical_test": bool(skip_historical_test),
@@ -1234,9 +1294,13 @@ def finetune_branching_with_frozen_gp(
     config = _training_config(
         extra_env_steps=extra_env_steps,
         lr=lr,
+        lr_end=lr_end,
+        lr_decay=lr_decay,
         epsilon_start=epsilon_start,
         epsilon_end=epsilon_end,
         epsilon_decay=epsilon_decay,
+        pairwise_interaction_rank=pairwise_interaction_rank,
+        pairwise_residual_warmup_steps=pairwise_residual_warmup_steps,
         seed=seed,
         device=resolved_device,
     )

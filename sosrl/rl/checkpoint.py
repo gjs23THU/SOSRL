@@ -47,6 +47,7 @@ def _agent_payload(agent) -> dict:
 
 
 def _branching_payload(agent: BranchingDQNAgent) -> dict:
+    interaction_rank = int(agent.config.pairwise_interaction_rank)
     return {
         "checkpoint_kind": "branching_scheduler",
         "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -71,8 +72,18 @@ def _branching_payload(agent: BranchingDQNAgent) -> dict:
             "task_advantage_head": [192, 128, 1],
             "system_advantage_head": [192, 128, 1],
             "state_value_head": [128, 128, 1],
+            "pairwise_interaction_rank": interaction_rank,
+            "pairwise_interaction_heads": (
+                {"task": [192, interaction_rank], "system": [192, interaction_rank]}
+                if interaction_rank
+                else None
+            ),
             "activation": "relu",
-            "joint_value": "V+A_task+A_system",
+            "joint_value": (
+                "V+A_task+A_system+I_task_system"
+                if interaction_rank
+                else "V+A_task+A_system"
+            ),
         },
         "config": asdict(agent.config),
         "q_net_state_dict": agent.q_net.state_dict(),
@@ -196,6 +207,8 @@ def load_branching_checkpoint(path, device=None, load_optimizer=True):
     checkpoint = _load_checkpoint(path, device)
     _validate_branching_schema(checkpoint)
     values = dict(checkpoint["config"])
+    values.setdefault("pairwise_interaction_rank", 0)
+    values.setdefault("pairwise_residual_warmup_steps", 0)
     values["device"] = device
     agent = BranchingDQNAgent(BranchingDQNConfig(**values))
     return _restore_branching(agent, checkpoint, bool(load_optimizer))
@@ -256,6 +269,8 @@ def load_combined_checkpoint(path, device=None, load_optimizer=True):
     if scheduler_kind == "branching_scheduler":
         _validate_branching_schema(scheduler_data)
         scheduler_values = dict(scheduler_data["config"])
+        scheduler_values.setdefault("pairwise_interaction_rank", 0)
+        scheduler_values.setdefault("pairwise_residual_warmup_steps", 0)
         scheduler_values["device"] = device
         scheduler_agent = BranchingDQNAgent(
             BranchingDQNConfig(**scheduler_values)
